@@ -59,12 +59,13 @@ class LocalBackendConfig:
     vector_dimension: int = field(
         default_factory=lambda: ML_MODEL_DEFAULTS.sentence_transformer_dim
     )
-    openai_api_key: str | None = None  # Required when embedder_backend="openai"
+    openai_api_key: str | None = field(default=None, repr=False)
     ollama_base_url: str = "http://localhost:11434"  # For embedder_backend="ollama"
     graph_persist: bool = True  # Use SQLiteGraphStore (bounded, persistent)
     graph_cache_size_kb: int = 8192  # 8MB default
     cache_enabled: bool = True
     cache_max_size: int = 1000
+    openai_base_url: str | None = None
 
 
 class LocalBackend:
@@ -190,6 +191,7 @@ class LocalBackend:
             embedder_model=self._config.embedder_model,
             vector_dimension=self._config.vector_dimension,
             openai_api_key=self._config.openai_api_key,
+            openai_base_url=self._config.openai_base_url,
             ollama_base_url=self._config.ollama_base_url,
             cache_enabled=self._config.cache_enabled,
             cache_max_size=self._config.cache_max_size,
