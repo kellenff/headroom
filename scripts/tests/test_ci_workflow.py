@@ -8,6 +8,25 @@ from pathlib import Path
 import yaml
 
 
+def test_upstream_sync_exception_is_pinned_to_reviewed_pr_and_commit() -> None:
+    exception = (
+        "github.repository == 'kellenff/headroom' && "
+        "github.event.pull_request.number == 4 && "
+        "github.event.pull_request.head.sha == 'fa2e6cbf33bbaefcea8e181b2052b884d3d38af1'"
+    )
+    ci = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    changelog = yaml.safe_load(
+        Path(".github/workflows/changelog-guard.yml").read_text(encoding="utf-8")
+    )
+
+    assert (
+        ci["jobs"]["commitlint"]["if"] == f"github.event_name == 'pull_request' && !({exception})"
+    )
+    assert changelog["jobs"]["no-manual-changelog"]["if"] == (
+        "${{ !startsWith(github.head_ref, 'release-please--') && !(" + exception + ") }}"
+    )
+
+
 def test_sharded_ci_verifies_offline_huggingface_cache_before_pytest() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     verify_step = "Verify offline HuggingFace model cache"

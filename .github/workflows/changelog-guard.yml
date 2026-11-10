@@ -6,7 +6,7 @@ name: Changelog Guard
 # merge turns the rest DIRTY. `.gitattributes merge=union` does not help because
 # GitHub squash-merge ignores merge drivers. So the fix is to stop hand-edits at
 # the source: this guard fails any PR that touches CHANGELOG.md, except
-# release-please's own release PR (the one place it is meant to change).
+# release-please's own release PR and the pinned upstream fork sync below.
 #
 # ponytail: uses the preinstalled gh CLI, no third-party action to pin. If a
 # rare PR legitimately must edit CHANGELOG.md, a maintainer can merge past this
@@ -21,8 +21,9 @@ permissions:
 
 jobs:
   no-manual-changelog:
-    # release-please's release PR is the sole author of CHANGELOG.md.
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    # The pinned fork sync imports release-please's upstream changelog verbatim.
+    if: >-
+      ${{ !startsWith(github.head_ref, 'release-please--') && !(github.repository == 'kellenff/headroom' && github.event.pull_request.number == 4 && github.event.pull_request.head.sha == 'fa2e6cbf33bbaefcea8e181b2052b884d3d38af1') }}
     runs-on: ubuntu-latest
     steps:
       - name: Reject manual CHANGELOG.md edits
