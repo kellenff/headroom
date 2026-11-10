@@ -604,7 +604,9 @@ jobs:
           retention-days: 7
 
   commitlint:
-    if: github.event_name == 'pull_request'
+    # Preserve the reviewed upstream history in the one-time fork sync.
+    if: >-
+      github.event_name == 'pull_request' && !(github.repository == 'kellenff/headroom' && github.event.pull_request.number == 4 && github.event.pull_request.head.sha == 'fa2e6cbf33bbaefcea8e181b2052b884d3d38af1')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
