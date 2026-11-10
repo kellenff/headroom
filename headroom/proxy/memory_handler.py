@@ -357,6 +357,27 @@ class MemoryHandler:
             embedder_backend = "onnx"
             embedder_model = "all-MiniLM-L6-v2"
             vector_dimension = 384
+            openai_api_key = None
+            openai_base_url = None
+            runtime = os.environ.get("HEADROOM_EMBEDDER_RUNTIME", "").strip().lower()
+
+            if runtime == "openai":
+                try:
+                    vector_dimension = int(os.environ.get("HEADROOM_EMBEDDER_DIMENSION", ""))
+                except ValueError as exc:
+                    raise ValueError(
+                        "HEADROOM_EMBEDDER_DIMENSION must be a positive integer"
+                    ) from exc
+                if vector_dimension < 1:
+                    raise ValueError("HEADROOM_EMBEDDER_DIMENSION must be a positive integer")
+                embedder_model = os.environ.get("HEADROOM_EMBEDDER_MODEL", "").strip()
+                if not embedder_model:
+                    raise ValueError("HEADROOM_EMBEDDER_MODEL is required for the openai runtime")
+                openai_api_key = os.environ.get("HEADROOM_EMBEDDER_API_KEY", "").strip()
+                if not openai_api_key:
+                    raise ValueError("HEADROOM_EMBEDDER_API_KEY is required for the openai runtime")
+                openai_base_url = os.environ.get("HEADROOM_EMBEDDER_BASE_URL", "").strip() or None
+                embedder_backend = "openai"
 
             # Opt-in GPU offload: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps routes embedding
             # through the torch sentence-transformers backend on the Apple GPU (MPS).
@@ -364,7 +385,7 @@ class MemoryHandler:
             # We switch only when MPS is actually available; otherwise keep the
             # existing default embedder selection path (ONNX when available, then
             # the pre-existing local sentence-transformers fallback).
-            if os.environ.get("HEADROOM_EMBEDDER_RUNTIME", "").strip().lower() == "pytorch_mps":
+            elif runtime == "pytorch_mps":
                 try:
                     import sentence_transformers  # noqa: F401
                     import torch
@@ -402,6 +423,8 @@ class MemoryHandler:
                 embedder_backend=embedder_backend,
                 embedder_model=embedder_model,
                 vector_dimension=vector_dimension,
+                openai_api_key=openai_api_key,
+                openai_base_url=openai_base_url,
             )
             self._backend = LocalBackend(backend_config)
             await self._backend._ensure_initialized()

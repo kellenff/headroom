@@ -7,6 +7,7 @@ and proper wiring between components.
 
 from __future__ import annotations
 
+import os
 import threading
 from importlib.metadata import entry_points
 from inspect import iscoroutinefunction
@@ -40,12 +41,12 @@ _MEMORY_STORE_GROUP = "headroom.memory_store"
 _MEMORY_VECTOR_GROUP = "headroom.memory_vector"
 _MEMORY_TEXT_GROUP = "headroom.memory_text"
 
-# Process-wide embedder cache keyed by (backend, model). Embedders are
+# Process-wide embedder cache keyed by model and connection settings. Embedders are
 # stateless with respect to the memory store, so a single instance can
 # safely serve every per-project ``LocalBackend`` created by the
 # BackendRouter. Without this cache, opening N project DBs would load
 # the sentence-transformers / ONNX model N times.
-_EMBEDDER_CACHE: dict[tuple[str, str, str], Embedder] = {}
+_EMBEDDER_CACHE: dict[tuple[str, ...], Embedder] = {}
 _EMBEDDER_CACHE_LOCK = threading.Lock()
 
 
@@ -156,7 +157,7 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
     """Create or return a cached embedder backend.
 
     The embedder is shared across every ``LocalBackend`` instance that
-    requests the same ``(embedder_backend, embedder_model)`` pair. This
+    requests the same model, endpoint, credentials, and vector dimension. This
     matters for the per-project storage router, which can open many
     backends in the same process and must not pay the
     sentence-transformers / ONNX model-load cost more than once.
@@ -171,11 +172,7 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
         ValueError: If the embedder backend is not supported.
     """
 
-    # Validate inputs ahead of the cache. The cache key is
-    # ``(backend, model)`` and intentionally does NOT include the API
-    # key — but that means a cached OpenAI embedder would shadow the
-    # config-validation step for a subsequent caller who forgot to pass
-    # ``openai_api_key``. Run the validation up front instead.
+    # Reject missing credentials even when another caller has a cached client.
     if config.embedder_backend == EmbedderBackend.OPENAI and not config.openai_api_key:
         raise ValueError("openai_api_key is required for OpenAI embedder")
 
@@ -187,11 +184,11 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
         # The Ollama backend is built with ``base_url=config.ollama_base_url``,
         # so two configs that share a backend and model but point at different
         # Ollama servers must NOT share a cached embedder — otherwise the second
-        # caller silently gets an embedder bound to the first server. (The
-        # ``openai_api_key`` omission is handled by the up-front validation
-        # above; ``ollama_base_url`` has no such guard and would just resolve to
-        # the wrong host.)
+        # caller silently gets an embedder bound to the first server.
         config.ollama_base_url or "",
+        config.openai_base_url or os.environ.get("OPENAI_BASE_URL", ""),
+        config.openai_api_key or "",
+        str(config.vector_dimension),
     )
 
     with _EMBEDDER_CACHE_LOCK:
@@ -215,6 +212,8 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
             embedder = OpenAIEmbedder(
                 api_key=config.openai_api_key,
                 model_name=config.embedder_model,
+                base_url=config.openai_base_url,
+                dimension=config.vector_dimension,
             )
 
         elif config.embedder_backend == EmbedderBackend.OLLAMA:

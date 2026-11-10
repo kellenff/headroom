@@ -192,6 +192,7 @@ config = MemoryConfig(
     embedder_backend=EmbedderBackend.OPENAI,
     openai_api_key="sk-...",
     embedder_model="text-embedding-3-small",
+    vector_dimension=1536,
 )
 
 # Ollama embeddings (local server, many models)
@@ -199,6 +200,60 @@ config = MemoryConfig(
     embedder_backend=EmbedderBackend.OLLAMA,
     ollama_base_url="http://localhost:11434",
     embedder_model="nomic-embed-text",
+)
+```
+
+### Custom Embedding APIs
+
+The proxy's default local memory storage backend can use an external
+**OpenAI-compatible embeddings API** for memory and learning. Set these variables
+before starting the proxy:
+
+```bash
+export HEADROOM_EMBEDDER_RUNTIME=openai
+export HEADROOM_EMBEDDER_BASE_URL=https://embeddings.example.com/v1
+export HEADROOM_EMBEDDER_MODEL=your-embedding-model
+export HEADROOM_EMBEDDER_DIMENSION=1024
+export HEADROOM_EMBEDDER_API_KEY="$EMBEDDING_API_KEY"
+
+mkdir -p .headroom/custom-embeddings
+headroom proxy --memory --memory-db-path .headroom/custom-embeddings/memory.db
+```
+
+The model, API key, and positive integer dimension are required in this mode.
+Use the model's native output dimension: this setting checks the returned vector
+size and configures the index; it does not request reduced dimensions from the
+provider. For a service without authentication, supply a nonempty placeholder key.
+The base URL includes any API prefix (such as `/v1`); Headroom appends `/embeddings`.
+If omitted, it uses `OPENAI_BASE_URL` or the standard OpenAI endpoint.
+
+Requests use `model`, `input`, and `encoding_format="float"`. Responses must contain
+one finite vector of the configured size per input, with unique zero-based
+`index` values. Headroom restores input order and normalizes the vectors.
+Each project inherits the same API settings, while different endpoints, API keys,
+or vector dimensions receive separate cached clients. `HEADROOM_OFFLINE=1` blocks
+embedding API calls, including calls to a local server.
+
+**Use a fresh memory database directory when changing models or endpoints**, even
+if the vector size stays the same. Existing vectors are not migrated or re-embedded.
+The API key is independent of the credentials used for chat requests. Unset
+`HEADROOM_EMBEDDER_RUNTIME` to restore the default embedder, or set it back to
+`pytorch_mps` to use the Apple GPU.
+
+The Python memory API supports the same service:
+
+```python
+import os
+
+from headroom.memory import MemoryConfig, EmbedderBackend
+
+config = MemoryConfig(
+    db_path="custom-memory.db",
+    embedder_backend=EmbedderBackend.OPENAI,
+    embedder_model="your-embedding-model",
+    openai_base_url="https://embeddings.example.com/v1",
+    openai_api_key=os.environ["EMBEDDING_API_KEY"],
+    vector_dimension=1024,
 )
 ```
 
@@ -220,9 +275,9 @@ export HEADROOM_EMBEDDER_RUNTIME=pytorch_mps
 When set, the embedder runs via the torch sentence-transformers backend on the
 Apple GPU instead of the default ONNX CPU embedder. Notes:
 
-- **Strictly opt-in.** `pytorch_mps` is the only accepted value; anything else
-  (or unset) keeps the default ONNX CPU embedder. Default behavior is unchanged,
-  and there is no CLI flag -- it is env-var only.
+- **Strictly opt-in.** `pytorch_mps` selects MPS; `openai` selects the external API
+  described above. Other values (or unset) keep the default ONNX CPU embedder.
+  There is no CLI flag -- runtime selection is env-var only.
 - **Auto-fallback.** It only activates when Apple MPS is actually available
   (Apple Silicon + torch). If MPS is unavailable or torch/sentence-transformers
   is not installed, it logs a warning and uses the existing default embedder
