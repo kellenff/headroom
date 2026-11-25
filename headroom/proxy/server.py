@@ -43,13 +43,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypedDict, cast
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
     from ..memory.tracker import MemoryTracker
+    from ..models.backends import EmbeddingBackendSettings
     from .outcome import RequestOutcome
 
 
@@ -769,7 +770,7 @@ def _check_rust_core() -> tuple[str, str | None]:
     return ("loaded", None)
 
 
-def _refuse_offline_egress(blocked: OfflineEgressBlocked, feature: str, fix: str) -> None:
+def _refuse_offline_egress(blocked: OfflineEgressBlocked, feature: str, fix: str) -> NoReturn:
     """Turn a startup-time air-gap refusal into a clean exit, never a traceback.
 
     ``OfflineEgressBlocked`` derives from ``BaseException``, so nothing in the
@@ -792,7 +793,9 @@ def _refuse_offline_egress(blocked: OfflineEgressBlocked, feature: str, fix: str
         str(blocked),
     )
     print(msg, file=sys.stderr, flush=True)
-    sys.exit(_EXIT_CONFIG)
+    # ``from None``: callers sit in an ``except`` block, and whatever the
+    # exception is chained to must not reach the traceback uvicorn prints.
+    raise SystemExit(_EXIT_CONFIG) from None
 
 
 def _configure_observability_or_refuse() -> None:
@@ -857,12 +860,17 @@ _KOMPRESS_PROVIDER_ENV = "HEADROOM_KOMPRESS_PROVIDER"
 _KOMPRESS_ENDPOINT_ENV = "HEADROOM_KOMPRESS_ENDPOINT"
 
 
-def _refuse_model_backend(feature: str, reason: str, fix: str) -> None:
+def _refuse_model_backend(feature: str, reason: str, fix: str) -> NoReturn:
     """Exit 78 for a model-backend selection that cannot work, naming the variable.
 
     ``reason`` comes from the backend helpers, whose messages name variables
     and never their values (a value may be a pasted key), and reduce a
     third-party factory's error to its class name.
+
+    The exit is raised ``from None``. Every caller is inside an ``except``
+    block, and the registry chains a plugin's own exception (message and
+    option values included) to the error it raises. Left chained, Starlette's
+    ``lifespan.startup.failed`` traceback, which uvicorn logs, would print it.
     """
     msg = f"FATAL: {feature} is misconfigured.\n    error: {reason}\n    fix:   {fix}\n"
     logger.error(
@@ -871,7 +879,7 @@ def _refuse_model_backend(feature: str, reason: str, fix: str) -> None:
         reason,
     )
     print(msg, file=sys.stderr, flush=True)
-    sys.exit(_EXIT_CONFIG)
+    raise SystemExit(_EXIT_CONFIG) from None
 
 
 def _close_preflight_backend(backend: object) -> None:
@@ -888,19 +896,109 @@ def _close_preflight_backend(backend: object) -> None:
         logger.debug("preflight backend close failed: %s", describe_exception(exc))
 
 
+def _memory_handler_enabled(config: ProxyConfig) -> bool:
+    """Whether ``HeadroomProxy`` creates a ``MemoryHandler`` for ``config``.
+
+    Stateless mode turns memory off, because memory persists to disk. The
+    startup checks use this same predicate, so they never refuse an embedder
+    the proxy is not going to build.
+    """
+    return bool(config.memory_enabled) and not config.stateless
+
+
+def _kompress_disabled_per_provider(
+    config: ProxyConfig, *, kompress_enabled: bool
+) -> tuple[bool, bool]:
+    """Return ``(anthropic_disabled, openai_disabled)`` for Kompress.
+
+    ``kompress_enabled`` is the router config's ``enable_kompress`` once the
+    compressor selection and ``disable_kompress`` are applied. It is the
+    baseline for both providers; a per-provider override
+    (``disable_kompress_{anthropic,openai}``) wins when set.
+    """
+    base_disabled = not kompress_enabled
+    anthropic_disabled = (
+        base_disabled
+        if config.disable_kompress_anthropic is None
+        else config.disable_kompress_anthropic
+    )
+    openai_disabled = (
+        base_disabled if config.disable_kompress_openai is None else config.disable_kompress_openai
+    )
+    return anthropic_disabled, openai_disabled
+
+
+def _apply_disable_kompress(router_config: ContentRouterConfig, config: ProxyConfig) -> None:
+    """Apply ``disable_kompress`` (and its fallback opt-in) to ``router_config``."""
+    if config.disable_kompress:
+        router_config.enable_kompress = False
+        # Opt-in restore of the legacy behaviour: send fall-through content
+        # to PASSTHROUGH instead of the default KOMPRESS fallback strategy.
+        if config.disable_kompress_fallback:
+            router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
+
+
+def _kompress_can_run(config: ProxyConfig) -> bool:
+    """Whether at least one pipeline ``HeadroomProxy`` builds for ``config`` runs Kompress.
+
+    Takes the steps ``HeadroomProxy.__init__`` takes: the router config
+    default, the compressor selection, ``disable_kompress``, then the
+    per-provider overrides. The ``/v1/compress`` pipelines derive from the
+    OpenAI router, so the OpenAI result covers them too.
+    """
+    probe = ContentRouterConfig()
+    _apply_compressor_selection(probe, config.compressors, warn=False)
+    _apply_disable_kompress(probe, config)
+    anthropic_disabled, openai_disabled = _kompress_disabled_per_provider(
+        config, kompress_enabled=probe.enable_kompress
+    )
+    return not (anthropic_disabled and openai_disabled)
+
+
+def _check_memory_backend_dimension(settings: EmbeddingBackendSettings, backend: object) -> None:
+    """Refuse a memory backend whose declared width is not ``HEADROOM_EMBEDDER_DIMENSION``.
+
+    The memory factory runs this same check when memory starts. There, a
+    mismatch turns memory off until restart, with one log line.
+    """
+    expected = settings.dimension
+    if expected is None:
+        return
+    from headroom.memory.factory import _check_declared_dimension
+
+    try:
+        _check_declared_dimension(
+            getattr(backend, "dimension", None),
+            expected,
+            f"The embedding backend {settings.source or 'HEADROOM_EMBEDDER_PROVIDER'} selects",
+        )
+    except ValueError:
+        _close_preflight_backend(backend)
+        raise
+
+
 def _preflight_model_backends(config: ProxyConfig) -> None:
     """Refuse, at startup, a model-backend selection that cannot work.
 
-    Covers the operator's three selections: the memory embedder
-    (``HEADROOM_EMBEDDER_*``, when memory runs on the local backend), the
-    relevance-scoring embedder (``HEADROOM_RELEVANCE_EMBEDDER_*``) and the
-    Kompress provider (``HEADROOM_KOMPRESS_PROVIDER``), the last two only when
-    the proxy optimizes. Each selected backend is constructed once and closed:
-    the built-ins open no connection and load no model when constructed, so
-    this catches an unknown name, a malformed variable, a missing model or key
-    and a missing package without touching the network. Without it each of
-    those surfaced later and quieter: memory turned itself off, relevance fell
-    back to BM25, and Kompress stopped compressing, each with one log line.
+    Covers the operator's three selections:
+
+    * the memory embedder (``HEADROOM_EMBEDDER_*``), when the proxy runs
+      memory on the local backend;
+    * the relevance-scoring embedder (``HEADROOM_RELEVANCE_EMBEDDER_*``);
+    * the Kompress provider (``HEADROOM_KOMPRESS_PROVIDER``), unless Kompress
+      is off for every provider.
+
+    The last two are checked whether or not ``config.optimize`` is set:
+    ``/v1/compress`` runs the content routers either way, and a degraded Rust
+    core turns ``optimize`` off during startup, so gating on it would make the
+    outcome depend on where the check runs.
+
+    Each selected backend is constructed once and closed: the built-ins open
+    no connection and load no model when constructed, so this catches an
+    unknown name, a malformed variable, a missing model or key and a missing
+    package without touching the network. Without it each of those surfaced
+    later and quieter: memory turned itself off, relevance fell back to BM25,
+    and Kompress stopped compressing, each with one log line.
 
     Under ``HEADROOM_OFFLINE`` the same construction is what notices a backend
     that would dial out, because backends call ``guard_egress`` in their
@@ -908,18 +1006,21 @@ def _preflight_model_backends(config: ProxyConfig) -> None:
     by name.
 
     Nothing is selected by default, so a default deployment does no work here.
+    Callers go through :func:`_preflight_model_backends_once`.
     """
     from headroom.models.backends import BackendError
 
     config_errors = (ValueError, TypeError, BackendError)
 
-    if config.memory_enabled and config.memory_backend == "local":
+    if _memory_handler_enabled(config) and config.memory_backend == "local":
         from headroom.memory.embedder_env import validate_memory_embedder_env
 
         feature = "the memory embedder (HEADROOM_EMBEDDER_*)"
         try:
             memory_settings = validate_memory_embedder_env()
             memory_backend = memory_settings.create() if memory_settings else None
+            if memory_settings is not None and memory_backend is not None:
+                _check_memory_backend_dimension(memory_settings, memory_backend)
         except OfflineEgressBlocked as blocked:
             _refuse_offline_egress(
                 blocked,
@@ -942,9 +1043,6 @@ def _preflight_model_backends(config: ProxyConfig) -> None:
                     memory_settings.name if memory_settings else "",
                     memory_settings.source if memory_settings else "",
                 )
-
-    if not config.optimize:
-        return
 
     if (os.environ.get(_RELEVANCE_EMBEDDER_PROVIDER_ENV) or "").strip():
         from headroom.relevance.backend_config import (
@@ -977,7 +1075,7 @@ def _preflight_model_backends(config: ProxyConfig) -> None:
                     getattr(relevance_backend, "name", ""),
                 )
 
-    if (os.environ.get(_KOMPRESS_PROVIDER_ENV) or "").strip():
+    if (os.environ.get(_KOMPRESS_PROVIDER_ENV) or "").strip() and _kompress_can_run(config):
         from headroom.transforms.kompress_backend import (
             create_kompress_backend,
             kompress_provider_settings_from_env,
@@ -1018,6 +1116,39 @@ def _preflight_model_backends(config: ProxyConfig) -> None:
             if kompress_backend is not None:
                 _close_preflight_backend(kompress_backend)
                 logger.info("event=model_backend_selected kind=kompress backend=%s", name)
+
+
+# Set on a ProxyConfig once _preflight_model_backends has passed for it, and
+# carried to multi-worker workers in the config payload. Not a dataclass field,
+# so it never shows up in the config's fields, repr or /stats.
+_MODEL_BACKENDS_CHECKED = "_model_backends_checked"
+
+
+def _preflight_model_backends_once(config: ProxyConfig) -> None:
+    """Run :func:`_preflight_model_backends` for ``config`` unless it already passed.
+
+    ``run_server`` calls this before uvicorn starts. A ``SystemExit`` raised in
+    the ASGI lifespan does not reach the process: uvicorn exits with its own
+    startup-failure status (3) instead, and with ``workers > 1`` its supervisor
+    starts the failed worker again. The lifespan still calls this, for callers
+    that serve ``create_app`` themselves; for a config ``run_server`` already
+    checked, that call does nothing, so each selected backend is constructed
+    once.
+    """
+    if getattr(config, _MODEL_BACKENDS_CHECKED, False):
+        return
+    _preflight_model_backends(config)
+    setattr(config, _MODEL_BACKENDS_CHECKED, True)
+
+
+def _export_offline_flag(config: ProxyConfig) -> None:
+    """Export ``config.offline`` as ``HEADROOM_OFFLINE`` (an explicit export wins).
+
+    The env-based egress predicates, ``guard_egress`` included, read the
+    variable, not the config.
+    """
+    if config.offline:
+        os.environ.setdefault(OFFLINE_ENV, "1")
 
 
 def _apply_relevance_embedder_env(router_config: ContentRouterConfig) -> None:
@@ -1140,6 +1271,8 @@ BUILTIN_COMPRESSOR_FLAGS: dict[str, str] = {
 def _apply_compressor_selection(
     router_config: ContentRouterConfig,
     compressors: set[str] | None,
+    *,
+    warn: bool = True,
 ) -> None:
     """Narrow the built-in compressor set on ``router_config`` in place.
 
@@ -1151,6 +1284,7 @@ def _apply_compressor_selection(
     registry) but are surfaced with a warning, because a typo'd selection is
     otherwise indistinguishable from "compress nothing" (#2384). This maps a
     selection onto the existing flags without adding any dispatch logic.
+    ``warn=False`` skips that warning, for a caller that only probes the result.
     """
     if compressors is None:
         return
@@ -1159,7 +1293,7 @@ def _apply_compressor_selection(
         return
     select_all = "*" in selected
     unmatched = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS) - {"*"})
-    if unmatched:
+    if unmatched and warn:
         if select_all or selected & set(BUILTIN_COMPRESSOR_FLAGS):
             logger.warning(
                 "compressor selection: %s match no built-in compressor "
@@ -1324,12 +1458,7 @@ class HeadroomProxy(
             router_config.ccr_inject_marker = False
             if hasattr(config, "ccr_inject_tool"):
                 config.ccr_inject_tool = False
-        if config.disable_kompress:
-            router_config.enable_kompress = False
-            # Opt-in restore of the legacy behaviour: send fall-through content
-            # to PASSTHROUGH instead of the default KOMPRESS fallback strategy.
-            if config.disable_kompress_fallback:
-                router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
+        _apply_disable_kompress(router_config, config)
         # `HEADROOM_LOSSLESS_ONLY=1` routes SmartCrusher through strict
         # marker-free mode: lossless tabular compaction still applies, but
         # any path that would emit a `<<ccr:…>>` marker (row-drop or
@@ -1378,16 +1507,11 @@ class HeadroomProxy(
         # exclusion, and read-protection are identical — so when both resolve
         # the same we reuse ONE ContentRouter instance and the Kompress model
         # still loads once (startup warmup dedupes transforms by id()).
+        # `_kompress_can_run` repeats these steps for the startup checks; a
+        # new step that changes `enable_kompress` belongs in both.
         base_kompress_disabled = not router_config.enable_kompress
-        anthropic_kompress_disabled = (
-            base_kompress_disabled
-            if config.disable_kompress_anthropic is None
-            else config.disable_kompress_anthropic
-        )
-        openai_kompress_disabled = (
-            base_kompress_disabled
-            if config.disable_kompress_openai is None
-            else config.disable_kompress_openai
+        anthropic_kompress_disabled, openai_kompress_disabled = _kompress_disabled_per_provider(
+            config, kompress_enabled=router_config.enable_kompress
         )
 
         def _router_config_for(kompress_disabled: bool) -> ContentRouterConfig:
@@ -1715,7 +1839,7 @@ class HeadroomProxy(
                 "Memory is disabled in stateless mode (it persists to disk). "
                 "Run without --stateless to enable persistent memory."
             )
-        elif config.memory_enabled:
+        elif _memory_handler_enabled(config):
             # Resolve memory DB path: empty → project-scoped default
             _mem_db_path = config.memory_db_path
             if not _mem_db_path:
@@ -3685,8 +3809,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # egress path appears that is neither guarded nor one of the four written
     # exceptions. TestDocsMatchTheGuarantee scans this file for the absolute
     # phrasings and fails while any remain.
-    if config.offline:
-        os.environ.setdefault("HEADROOM_OFFLINE", "1")
+    _export_offline_flag(config)
     if is_offline():
         apply_offline_env()
         logger.warning(
@@ -3815,7 +3938,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _rust_core_error,
             )
 
-        _preflight_model_backends(config)
+        # A no-op when `run_server` already checked this config before uvicorn
+        # started (so a refusal there is the process's exit 78); this call is
+        # for apps served from `create_app` directly.
+        _preflight_model_backends_once(config)
         _configure_observability_or_refuse()
 
         app.state.started_at = time.time()
@@ -6831,6 +6957,11 @@ def _proxy_config_payload(config: ProxyConfig) -> dict[str, Any]:
         except TypeError:
             continue
         payload[field.name] = value
+    if getattr(config, _MODEL_BACKENDS_CHECKED, False):
+        # The supervisor ran the model-backend checks before starting the
+        # workers, which inherit its environment; they need not build the
+        # backends again.
+        payload[_MODEL_BACKENDS_CHECKED] = True
     return payload
 
 
@@ -6895,7 +7026,11 @@ def _proxy_config_from_env() -> ProxyConfig:
                 values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
             if "profile_seeded_env_keys" in values:
                 values["profile_seeded_env_keys"] = frozenset(values["profile_seeded_env_keys"])
-            return ProxyConfig(**values)
+            backends_checked = values.pop(_MODEL_BACKENDS_CHECKED, False) is True
+            restored = ProxyConfig(**values)
+            if backends_checked:
+                setattr(restored, _MODEL_BACKENDS_CHECKED, True)
+            return restored
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
                 "Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV
@@ -7195,11 +7330,21 @@ def run_server(
                 "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
                 workers,
             )
+        # Each worker builds its own app, so run the model-backend checks here,
+        # in the supervisor, before uvicorn starts the workers: a refusal is
+        # then this process's exit 78, not a worker that dies and is started
+        # again. The workers' create_app exports config.offline before its
+        # checks; so does this.
+        _export_offline_flag(config)
+        _preflight_model_backends_once(config)
         os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
         app_target = "headroom.proxy.server:create_app_from_env"
         uvicorn_kwargs["factory"] = True
     else:
         app_target = create_app(config)
+        # Before uvicorn starts, so a refusal is this process's exit 78. The
+        # lifespan's own call is then a no-op.
+        _preflight_model_backends_once(config)
 
     # "warning" keeps the default terminal quiet (uvicorn's access log is one line
     # per request). It was previously hardcoded, which left deployed proxies with
