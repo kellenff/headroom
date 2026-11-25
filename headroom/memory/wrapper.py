@@ -69,6 +69,9 @@ class MemoryWrapper:
         embedder_backend: EmbedderBackend = EmbedderBackend.LOCAL,
         openai_api_key: str | None = None,
         _memory: HierarchicalMemory | None = None,  # For testing
+        *,
+        embedder: Any = None,
+        vector_dimension: int | None = None,
     ):
         """Initialize the memory wrapper.
 
@@ -82,6 +85,12 @@ class MemoryWrapper:
             embedder_backend: Which embedder to use (LOCAL or OPENAI)
             openai_api_key: API key if using OpenAI embeddings
             _memory: Override memory system (for testing)
+            embedder: Your own embedder, used instead of ``embedder_backend``:
+                an async memory ``Embedder``, a synchronous
+                :class:`~headroom.models.backends.EmbeddingBackend`, or a plain
+                function ``fn(list[str]) -> rows``. You own its lifecycle.
+            vector_dimension: Width of the embedder's vectors. Defaults to 384,
+                the default local model's.
         """
         self._client = client
         self._user_id = user_id
@@ -92,10 +101,16 @@ class MemoryWrapper:
 
         # Initialize memory system (async, so we defer)
         self._memory = _memory
+        # Only when given, so MemoryConfig keeps owning the default.
+        dimension_kwargs: dict[str, Any] = (
+            {} if vector_dimension is None else {"vector_dimension": vector_dimension}
+        )
         self._memory_config = MemoryConfig(
             db_path=self._db_path,
             embedder_backend=embedder_backend,
             openai_api_key=openai_api_key,
+            embedder=embedder,
+            **dimension_kwargs,
         )
         self._initialized = _memory is not None
 
@@ -381,6 +396,9 @@ def with_memory(
     agent_id: str | None = None,
     embedder_backend: EmbedderBackend = EmbedderBackend.LOCAL,
     openai_api_key: str | None = None,
+    *,
+    embedder: Any = None,
+    vector_dimension: int | None = None,
     **kwargs: Any,
 ) -> MemoryWrapper:
     """Wrap an LLM client to add automatic memory with zero extra latency.
@@ -397,6 +415,9 @@ def with_memory(
         agent_id: Optional agent ID for agent-scoped memories
         embedder_backend: Which embedder to use (LOCAL or OPENAI)
         openai_api_key: API key if using OpenAI embeddings
+        embedder: Your own embedder, used instead of ``embedder_backend``
+            (see :class:`MemoryWrapper`)
+        vector_dimension: Width of the embedder's vectors (default 384)
         **kwargs: Additional arguments passed to MemoryWrapper
 
     Returns:
@@ -430,5 +451,7 @@ def with_memory(
         agent_id=agent_id,
         embedder_backend=embedder_backend,
         openai_api_key=openai_api_key,
+        embedder=embedder,
+        vector_dimension=vector_dimension,
         **kwargs,
     )

@@ -352,11 +352,15 @@ def _build_sync_backend(db_path: str) -> Any:
     torch-free ONNX embedder so ``wrap --memory`` sync works on the proxy extras
     without sentence-transformers/PyTorch (#1092). It loads the same
     ``all-MiniLM-L6-v2`` 384-dim model as the local embedder, so vectors stay
-    compatible with what the proxy writes — no DB migration.
+    compatible with what the proxy writes — no DB migration. When
+    ``HEADROOM_EMBEDDER_*`` selects another embedder, use that one instead, as
+    the proxy does.
     """
     from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+    from headroom.memory.embedder_env import local_backend_embedder_kwargs_from_env
 
-    config = LocalBackendConfig(db_path=db_path, embedder_backend="onnx")
+    embedder_kwargs = local_backend_embedder_kwargs_from_env() or {"embedder_backend": "onnx"}
+    config = LocalBackendConfig(db_path=db_path, **embedder_kwargs)
     return LocalBackend(config)
 
 

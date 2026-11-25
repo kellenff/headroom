@@ -750,13 +750,15 @@ class TestCrossAgentInterop:
         assert "FastAPI" in agents_content or "8787" in agents_content
 
 
-def test_sync_backend_uses_onnx_embedder(tmp_path):
+def test_sync_backend_uses_onnx_embedder(tmp_path, monkeypatch):
     """#1092: the sync subprocess must pick the torch-free ONNX embedder.
 
     Defaulting to the LOCAL (sentence-transformers) embedder makes
     `wrap --memory` crash with an ImportError on the proxy extras. The backend
     must match the proxy MCP server, which uses ONNX.
     """
+    for var in ("HEADROOM_EMBEDDER_PROVIDER", "HEADROOM_EMBEDDER_RUNTIME"):
+        monkeypatch.delenv(var, raising=False)
     backend = _build_sync_backend(str(tmp_path / "memory.db"))
     assert backend._config.embedder_backend == "onnx"
 

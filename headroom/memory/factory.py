@@ -7,6 +7,9 @@ and proper wiring between components.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import os
 import threading
 from importlib.metadata import entry_points
@@ -14,12 +17,14 @@ from inspect import iscoroutinefunction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from headroom.log_safety import describe_exception
 from headroom.memory.config import (
     EmbedderBackend,
     MemoryConfig,
     StoreBackend,
     TextBackend,
     VectorBackend,
+    external_embedder_selection,
 )
 
 if TYPE_CHECKING:
@@ -36,6 +41,8 @@ if TYPE_CHECKING:
     )
 
 
+logger = logging.getLogger(__name__)
+
 # Extension groups for memory backends registered via setuptools entry points.
 _MEMORY_STORE_GROUP = "headroom.memory_store"
 _MEMORY_VECTOR_GROUP = "headroom.memory_vector"
@@ -45,7 +52,8 @@ _MEMORY_TEXT_GROUP = "headroom.memory_text"
 # stateless with respect to the memory store, so a single instance can
 # safely serve every per-project ``LocalBackend`` created by the
 # BackendRouter. Without this cache, opening N project DBs would load
-# the sentence-transformers / ONNX model N times.
+# the sentence-transformers / ONNX model N times. A cached embedder is shared,
+# so no single memory system owns it (see ``embedder_is_shared``).
 _EMBEDDER_CACHE: dict[tuple[str, ...], Embedder] = {}
 _EMBEDDER_CACHE_LOCK = threading.Lock()
 
@@ -107,11 +115,13 @@ async def create_memory_system(
     """
     config = config or MemoryConfig()
 
+    # Create the embedder first: it is where configuration mistakes surface
+    # (unknown backend, missing model or key, wrong dimension), and failing
+    # here leaves no database file behind for the operator to clean up.
+    embedder = _create_embedder(config)
+
     # Create store
     store = _create_store(config)
-
-    # Create embedder (needed by vector index for text queries)
-    embedder = _create_embedder(config)
 
     # Create vector index
     vector_index = _create_vector_index(config)
@@ -162,6 +172,20 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
     backends in the same process and must not pay the
     sentence-transformers / ONNX model-load cost more than once.
 
+    ``config.embedder``, when set, wins over ``embedder_backend`` and is never
+    cached: the caller built it and owns its lifecycle.
+
+    For ``EmbedderBackend.EXTERNAL`` the backend comes from the
+    :mod:`headroom.models.backends` registry. Its model comes only from
+    ``embedder_backend_name`` (``"name:model"``) or ``embedder_options["model"]``;
+    ``embedder_model`` is ignored, because it always holds a MiniLM default that
+    would otherwise be sent to whichever backend was chosen.
+
+    Only EXTERNAL and injected embedders are checked against
+    ``vector_dimension`` up front. The built-in embedders keep their historical
+    behaviour (Ollama, for one, reports 768 while the default index is 384) and
+    are validated row by row instead.
+
     Args:
         config: Memory system configuration.
 
@@ -169,8 +193,18 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
         An Embedder implementation based on config.embedder_backend.
 
     Raises:
-        ValueError: If the embedder backend is not supported.
+        ValueError: If the embedder backend is not supported, an EXTERNAL or
+            injected embedder's dimension differs from ``vector_dimension``,
+            or the EXTERNAL model is given twice with different values.
+        TypeError: ``config.embedder`` is not an embedder, backend or callable.
+        headroom.models.backends.BackendError: An EXTERNAL backend is unknown
+            or failed to construct.
     """
+    if config.embedder is not None:
+        return _injected_embedder(config)
+
+    if config.embedder_backend == EmbedderBackend.EXTERNAL:
+        return _external_embedder(config)
 
     # Reject missing credentials even when another caller has a cached client.
     if config.embedder_backend == EmbedderBackend.OPENAI and not config.openai_api_key:
@@ -228,6 +262,118 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
 
         _EMBEDDER_CACHE[key] = embedder
         return embedder
+
+
+def embedder_is_shared(config: MemoryConfig, embedder: object) -> bool:
+    """Whether ``embedder`` belongs to someone other than one memory system.
+
+    True for the caller's own ``config.embedder`` and for any instance in the
+    process-wide cache. A memory system built around a shared embedder must not
+    close it: the proxy closes and rebuilds memory backends (after a failed or
+    timed-out init, on shutdown of one project), and every other backend in the
+    process still holds the same embedder.
+    """
+    if config.embedder is not None:
+        return True
+    with _EMBEDDER_CACHE_LOCK:
+        return any(cached is embedder for cached in _EMBEDDER_CACHE.values())
+
+
+def _is_async_embedder(obj: object) -> bool:
+    from headroom.memory.ports import Embedder
+
+    return (
+        isinstance(obj, Embedder)
+        and iscoroutinefunction(getattr(obj, "embed", None))
+        and iscoroutinefunction(getattr(obj, "embed_batch", None))
+    )
+
+
+def _injected_embedder(config: MemoryConfig) -> Embedder:
+    """Adapt ``config.embedder`` without caching it (the caller owns it)."""
+    supplied = config.embedder
+    if _is_async_embedder(supplied):
+        embedder: Embedder = supplied
+        declared = getattr(supplied, "dimension", None)
+    else:
+        if iscoroutinefunction(getattr(supplied, "embed", None)):
+            raise TypeError(
+                "An async embedder must implement the memory Embedder protocol: async "
+                "embed() and embed_batch(), plus dimension, model_name and max_tokens"
+            )
+        from headroom.memory.adapters.backend_embedder import BackendEmbedder
+        from headroom.models.backends import as_embedding_backend
+
+        backend = as_embedding_backend(supplied)
+        declared = backend.dimension
+        embedder = BackendEmbedder(backend, dimension=config.vector_dimension)
+    _check_declared_dimension(declared, config.vector_dimension, "The supplied embedder")
+    return embedder
+
+
+def _external_embedder(config: MemoryConfig) -> Embedder:
+    """Build (or reuse) the registry backend selected by ``embedder_backend_name``."""
+    name, model = external_embedder_selection(config)
+    options = {
+        key: value
+        for key, value in config.embedder_options.items()
+        if key not in ("model", "dimension")
+    }
+    key = (
+        EmbedderBackend.EXTERNAL.value,
+        name,
+        model or "",
+        str(config.vector_dimension),
+        # Options carry endpoints and credentials: two configs that differ in
+        # any of them must not share a client. Hashed, so the key never holds
+        # a raw credential longer than the options themselves do.
+        hashlib.sha256(
+            json.dumps(options, sort_keys=True, default=repr).encode("utf-8")
+        ).hexdigest(),
+    )
+
+    with _EMBEDDER_CACHE_LOCK:
+        cached = _EMBEDDER_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        from headroom.memory.adapters.backend_embedder import BackendEmbedder
+        from headroom.models.backends import create_embedding_backend
+
+        backend = create_embedding_backend(
+            name, **options, model=model, dimension=config.vector_dimension
+        )
+        try:
+            _check_declared_dimension(
+                backend.dimension, config.vector_dimension, f"Embedding backend {name!r}"
+            )
+        except ValueError:
+            _close_quietly(backend)
+            raise
+        embedder: Embedder = BackendEmbedder(backend, dimension=config.vector_dimension)
+        _EMBEDDER_CACHE[key] = embedder
+        return embedder
+
+
+def _close_quietly(backend: object) -> None:
+    """Release a backend that is being discarded; its own close error is secondary."""
+    close = getattr(backend, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.debug("Closing a discarded embedding backend failed: %s", describe_exception(exc))
+
+
+def _check_declared_dimension(declared: object, expected: int, what: str) -> None:
+    """Refuse an embedder whose stated width cannot fill the vector index."""
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared != expected:
+        raise ValueError(
+            f"{what} produces {declared}-dimensional vectors, but the memory vector index "
+            f"has vector_dimension={expected}. Set vector_dimension (proxy: "
+            f"HEADROOM_EMBEDDER_DIMENSION) to the model's output width."
+        )
 
 
 def _reset_embedder_cache_for_tests() -> None:

@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -485,3 +486,172 @@ def test_save_does_not_supersede_a_semantically_similar_memory() -> None:
         importance=0.9,
     )
     assert result[0].kwargs["text"].startswith("Saved 1 new, updated 0 existing")
+
+
+# ---------------------------------------------------------------------------
+# Embedder selection and failures a retry cannot fix
+# ---------------------------------------------------------------------------
+
+
+def _clear_embedder_env(monkeypatch) -> None:
+    for var in (
+        "HEADROOM_EMBEDDER_PROVIDER",
+        "HEADROOM_EMBEDDER_RUNTIME",
+        "HEADROOM_EMBEDDER_MODEL",
+        "HEADROOM_EMBEDDER_BASE_URL",
+        "HEADROOM_EMBEDDER_API_KEY",
+        "HEADROOM_EMBEDDER_DIMENSION",
+        "HEADROOM_EMBEDDER_IDENTITY_CHECK",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _capture_backend_configs(monkeypatch, backend) -> list:
+    configs = []
+
+    def create_backend(config):
+        configs.append(config)
+        return backend
+
+    monkeypatch.setattr(mcp_server_mod, "Server", _CapturingServer)
+    monkeypatch.setattr(mcp_server_mod, "LocalBackend", create_backend)
+    monkeypatch.setattr(mcp_server_mod, "_warm_up_backend", AsyncMock())
+    monkeypatch.setattr(mcp_server_mod, "_handle_search", AsyncMock(return_value=["ok"]))
+    return configs
+
+
+def test_default_embedder_is_onnx(monkeypatch) -> None:
+    _clear_embedder_env(monkeypatch)
+    configs = _capture_backend_configs(monkeypatch, SimpleNamespace(close=AsyncMock()))
+
+    server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
+    asyncio.run(server.call_tool_handler(None, _CallParams("memory_search", {"query": "q"})))
+
+    assert configs[0].embedder_backend == "onnx"
+    assert configs[0].vector_dimension == 384
+
+
+def test_the_proxy_embedder_settings_are_honoured(monkeypatch) -> None:
+    """Same HEADROOM_EMBEDDER_* as the proxy, so both open one embedding space."""
+    _clear_embedder_env(monkeypatch)
+    monkeypatch.setenv("HEADROOM_EMBEDDER_PROVIDER", "openai")
+    monkeypatch.setenv("HEADROOM_EMBEDDER_MODEL", "nomic-embed-text")
+    monkeypatch.setenv("HEADROOM_EMBEDDER_BASE_URL", "http://gpu-box:8080/v1")
+    monkeypatch.setenv("HEADROOM_EMBEDDER_DIMENSION", "768")
+    configs = _capture_backend_configs(monkeypatch, SimpleNamespace(close=AsyncMock()))
+
+    server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
+    asyncio.run(server.call_tool_handler(None, _CallParams("memory_search", {"query": "q"})))
+
+    config = configs[0]
+    assert config.embedder_backend == "external"
+    assert config.embedder_backend_name == "openai"
+    assert config.embedder_options["model"] == "nomic-embed-text"
+    assert config.vector_dimension == 768
+
+
+def test_invalid_embedder_settings_return_an_error_result(monkeypatch) -> None:
+    _clear_embedder_env(monkeypatch)
+    monkeypatch.setenv("HEADROOM_EMBEDDER_PROVIDER", "openai")  # no DIMENSION
+    configs = _capture_backend_configs(monkeypatch, SimpleNamespace(close=AsyncMock()))
+
+    server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
+    result = asyncio.run(
+        server.call_tool_handler(None, _CallParams("memory_search", {"query": "q"}))
+    )
+
+    assert result.kwargs == {"is_error": True}
+    assert "HEADROOM_EMBEDDER_DIMENSION" in result.content[0].kwargs["text"]
+    assert configs == []  # nothing was opened
+
+
+def test_an_air_gap_refusal_returns_an_error_result_and_is_retried_later(monkeypatch) -> None:
+    from headroom.offline import OfflineEgressBlocked
+
+    async def scenario() -> None:
+        _clear_embedder_env(monkeypatch)
+        refused_backend = SimpleNamespace(close=AsyncMock())
+        ready_backend = SimpleNamespace(close=AsyncMock())
+        backends = iter([refused_backend, ready_backend])
+
+        async def warm_up(candidate, user_id: str) -> None:
+            if candidate is refused_backend:
+                raise OfflineEgressBlocked("memory embedding API", "embeddings.example")
+
+        handle_search = AsyncMock(return_value=["search result"])
+        monkeypatch.setattr(mcp_server_mod, "Server", _CapturingServer)
+        monkeypatch.setattr(mcp_server_mod, "LocalBackend", lambda config: next(backends))
+        monkeypatch.setattr(mcp_server_mod, "_warm_up_backend", warm_up)
+        monkeypatch.setattr(mcp_server_mod, "_handle_search", handle_search)
+
+        server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
+        refused = await server.call_tool_handler(None, _CallParams("memory_search", {"query": "q"}))
+        assert refused.kwargs == {"is_error": True}
+        assert "HEADROOM_OFFLINE" in refused.content[0].kwargs["text"]
+        refused_backend.close.assert_awaited_once()
+        handle_search.assert_not_awaited()
+
+        # The failed init was discarded, so the next call starts a fresh one.
+        result = await server.call_tool_handler(None, _CallParams("memory_search", {"query": "q"}))
+        assert result.content == ["search result"]
+        handle_search.assert_awaited_once()
+        assert handle_search.await_args.args[0] is ready_backend
+
+    asyncio.run(scenario())
+
+
+def test_a_database_from_another_embedder_is_refused_not_mixed(monkeypatch, tmp_path) -> None:
+    """The proxy filled this database through a custom embedder; the MCP server's
+    default (ONNX MiniLM) must not search or write it."""
+    from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+    from headroom.memory.factory import _reset_embedder_cache_for_tests
+    from headroom.models.backends import EMBEDDING_BACKENDS, register_embedding_backend
+
+    class ProxyEmbedder:
+        name = "proxy-fake"
+        model_name = "proxy-model"
+
+        def __init__(self, model=None, dimension=None, **_):
+            self.dimension = dimension
+
+        def embed(self, texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    _clear_embedder_env(monkeypatch)
+    EMBEDDING_BACKENDS._reset_for_tests()
+    _reset_embedder_cache_for_tests()
+    register_embedding_backend("proxy-fake", ProxyEmbedder)
+    db = tmp_path / "memory.db"
+    try:
+
+        async def scenario() -> None:
+            proxy = LocalBackend(
+                LocalBackendConfig(
+                    db_path=str(db),
+                    embedder_backend="external",
+                    embedder_backend_name="proxy-fake:proxy-model",
+                    vector_dimension=3,
+                )
+            )
+            await proxy.save_memory("written by the proxy", user_id="alice")
+            await proxy.close()
+
+            monkeypatch.setattr(mcp_server_mod, "Server", _CapturingServer)
+            server = mcp_server_mod.create_memory_server(str(db), user_id="alice")
+            result = await server.call_tool_handler(
+                None, _CallParams("memory_save", {"facts": ["must not land"]})
+            )
+            text = result.content[0].kwargs["text"]
+            assert result.kwargs == {"is_error": True}
+            assert "'proxy-fake:proxy-model:3'" in text
+            assert "'sentence-transformers:all-MiniLM-L6-v2:384'" in text
+            await server._headroom_close()
+
+        asyncio.run(scenario())
+
+        with sqlite3.connect(db) as conn:
+            contents = [row[0] for row in conn.execute("SELECT content FROM memories")]
+        assert contents == ["written by the proxy"]
+    finally:
+        EMBEDDING_BACKENDS._reset_for_tests()
+        _reset_embedder_cache_for_tests()

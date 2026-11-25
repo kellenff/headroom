@@ -23,6 +23,7 @@ and embedder-index pressure predictable.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -416,20 +417,13 @@ class BackendRouter:
 
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            template = self._config.backend_config_template
-            cfg = LocalBackendConfig(
+            # Copy every template field, so a setting added to
+            # LocalBackendConfig reaches project DBs without editing this list
+            # (the embedder settings once did not).
+            cfg = dataclasses.replace(
+                self._config.backend_config_template,
                 db_path=str(db_path),
                 graph_db_path=str(db_path.with_name(f"{db_path.stem}_graph{db_path.suffix}")),
-                embedder_backend=template.embedder_backend,
-                embedder_model=template.embedder_model,
-                vector_dimension=template.vector_dimension,
-                openai_api_key=template.openai_api_key,
-                openai_base_url=template.openai_base_url,
-                ollama_base_url=template.ollama_base_url,
-                graph_persist=template.graph_persist,
-                graph_cache_size_kb=template.graph_cache_size_kb,
-                cache_enabled=template.cache_enabled,
-                cache_max_size=template.cache_max_size,
             )
 
             backend = LocalBackend(cfg)

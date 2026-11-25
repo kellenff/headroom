@@ -32,6 +32,7 @@ from headroom.evals.memory.locomo import (
 )
 from headroom.evals.metrics import compute_exact_match, compute_f1
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+from headroom.memory.embedder_env import local_backend_embedder_kwargs_from_env
 from headroom.memory.models import Memory
 from headroom.memory.system import MemoryBackend
 from headroom.memory.tools import MEMORY_TOOLS
@@ -390,8 +391,7 @@ class LoCoMoEvaluatorV2:
                 # Default to LocalBackend
                 db_dir = tempfile.gettempdir()
                 db_path = self._config.db_path or f"{db_dir}/locomo_v2_{uuid.uuid4().hex[:8]}.db"
-                backend_config = LocalBackendConfig(db_path=db_path)
-                self._backend = LocalBackend(backend_config)
+                self._backend = self._default_backend(db_path)
 
             try:
                 # Phase 1: Replay conversation, letting LLM save memories
@@ -893,6 +893,17 @@ The answer should contain ONLY the specific information requested, nothing more.
         except Exception as e:
             logger.warning(f"Search failed: {e}")
             return []
+
+    @staticmethod
+    def _default_backend(db_path: str) -> LocalBackend:
+        """A LocalBackend on the embedder ``HEADROOM_EMBEDDER_*`` selects.
+
+        So a pluggable embedder can be evaluated with no code change; unset,
+        the built-in default is measured as before.
+        """
+        return LocalBackend(
+            LocalBackendConfig(db_path=db_path, **local_backend_embedder_kwargs_from_env())
+        )
 
     def _aggregate_results(
         self,

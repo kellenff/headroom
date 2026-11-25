@@ -39,6 +39,9 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+from headroom.memory.embedder_env import local_backend_embedder_kwargs_from_env
+from headroom.models.backends import BackendError
+from headroom.offline import OfflineEgressBlocked, note_refusal
 
 logger = logging.getLogger("headroom.memory.mcp")
 
@@ -166,14 +169,27 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
     _close_lock = asyncio.Lock()
 
     async def _init_backend() -> LocalBackend:
-        """Initialize backend with ONNX embedder (fast, no PyTorch)."""
+        """Initialize the backend: the ONNX embedder (fast, no PyTorch) by default,
+        or the one ``HEADROOM_EMBEDDER_*`` selects, so this server reads the same
+        embedding space as the proxy that shares its database."""
         nonlocal _backend, _init_task
-        config = LocalBackendConfig(db_path=db_path, embedder_backend="onnx")
-        backend = LocalBackend(config)
         init_task = asyncio.current_task()
         try:
+            embedder_kwargs = local_backend_embedder_kwargs_from_env() or {
+                "embedder_backend": "onnx"
+            }
+        except Exception:
+            # Invalid HEADROOM_EMBEDDER_* settings: nothing was opened yet.
+            if _init_task is init_task:
+                _init_task = None
+            raise
+        backend = LocalBackend(LocalBackendConfig(db_path=db_path, **embedder_kwargs))
+        try:
             await _warm_up_backend(backend, user_id)
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError, OfflineEgressBlocked):
+            # OfflineEgressBlocked is a BaseException: named here so an
+            # air-gap refusal also closes the half-built backend and clears
+            # the cached task instead of leaving both behind.
             try:
                 await backend.close()
             except Exception as cleanup_error:
@@ -200,7 +216,10 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
         if error is not None:
             if _init_task is init_task:
                 _init_task = None
-            logger.warning("Memory MCP: backend initialization failed: %s", error)
+            if isinstance(error, OfflineEgressBlocked):
+                note_refusal(error, logger)
+            else:
+                logger.warning("Memory MCP: backend initialization failed: %s", error)
 
     def _start_backend_init() -> asyncio.Task[LocalBackend]:
         """Start backend initialization once for all concurrent callers."""
@@ -222,7 +241,8 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
             if init_task.done() and _init_task is init_task:
                 _init_task = None
             raise
-        except Exception:
+        except (Exception, OfflineEgressBlocked):
+            # A failed init is discarded so the next call starts a fresh one.
             if _init_task is init_task:
                 _init_task = None
             raise
@@ -257,7 +277,14 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
         name = params.name
         # 2.x types ``arguments`` as optional; the handlers below index into it.
         arguments: dict[str, Any] = params.arguments or {}
-        backend = await _get_backend()
+        try:
+            backend = await _get_backend()
+        except OfflineEgressBlocked as blocked:
+            return _unavailable_result(note_refusal(blocked, logger))
+        except (ValueError, BackendError) as exc:
+            # Configuration errors (HEADROOM_EMBEDDER_*, an embedder mismatch)
+            # are worded to be shown; tell the agent why memory is off.
+            return _unavailable_result(str(exc))
 
         content: list[TextContent]
         if name == "memory_search":
@@ -276,6 +303,14 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
     )
     server._headroom_close = _close_backend  # type: ignore[attr-defined]
     return server
+
+
+def _unavailable_result(reason: str) -> CallToolResult:
+    """A tool error saying memory cannot be opened, and why."""
+    return CallToolResult(
+        content=[TextContent(type="text", text=f"Memory unavailable: {reason}")],
+        is_error=True,
+    )
 
 
 async def _handle_search(

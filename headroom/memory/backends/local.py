@@ -22,13 +22,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from headroom.memory.adapters.graph_models import Entity, Relationship, Subgraph
+from headroom.memory.config import EmbedderBackend
 from headroom.memory.models import Memory, normalize_entity_refs
 from headroom.memory.ports import MemorySearchResult
+from headroom.models.backends.registry import parse_backend_spec
 from headroom.models.config import ML_MODEL_DEFAULTS
 
 if TYPE_CHECKING:
     from headroom.memory.adapters.graph import InMemoryGraphStore
     from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+    from headroom.memory.config import MemoryConfig
     from headroom.memory.core import HierarchicalMemory
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,10 @@ class LocalBackendConfig:
         db_path: Path to the SQLite database file for memories.
         graph_db_path: Path to the SQLite database file for graph. If None,
                       derives from db_path (e.g., "memory.db" -> "memory_graph.db").
+        embedder_backend: ``"local"`` (sentence-transformers), ``"onnx"``,
+            ``"openai"``, ``"ollama"`` or ``"external"`` (a backend from
+            :mod:`headroom.models.backends`), case-insensitive, or an
+            :class:`~headroom.memory.config.EmbedderBackend` member.
         embedder_model: Name of the sentence-transformers model for embeddings.
         vector_dimension: Dimension of embedding vectors (must match embedder model).
         graph_persist: If True, use SQLiteGraphStore (bounded, persistent).
@@ -50,11 +57,21 @@ class LocalBackendConfig:
                             Higher = more memory, faster queries. Default: 8192 (8MB).
         cache_enabled: Whether to enable memory caching.
         cache_max_size: Maximum number of entries in the cache.
+        embedder_backend_name: For ``"external"``: the backend spec, ``"name"``
+            or ``"name:model"``.
+        embedder_options: For ``"external"``: the backend's constructor options.
+        embedder: An embedder you built yourself (async memory ``Embedder``,
+            sync ``EmbeddingBackend`` or ``fn(list[str]) -> rows``); wins over
+            ``embedder_backend``. See :class:`~headroom.memory.config.MemoryConfig`.
+        enforce_embedder_identity: Refuse to open a database written by a
+            different embedder (see :mod:`headroom.memory.embedder_identity`).
+            ``HEADROOM_EMBEDDER_IDENTITY_CHECK=0`` also turns it off.
     """
 
     db_path: str = "memory.db"
     graph_db_path: str | None = None  # Derived from db_path if not specified
-    embedder_backend: str = "local"  # "local" (sentence-transformers), "openai", "ollama"
+    # "local" (sentence-transformers), "onnx", "openai", "ollama", "external"
+    embedder_backend: str | EmbedderBackend = "local"
     embedder_model: str = field(default_factory=lambda: ML_MODEL_DEFAULTS.sentence_transformer)
     vector_dimension: int = field(
         default_factory=lambda: ML_MODEL_DEFAULTS.sentence_transformer_dim
@@ -66,6 +83,40 @@ class LocalBackendConfig:
     cache_enabled: bool = True
     cache_max_size: int = 1000
     openai_base_url: str | None = None
+    embedder_backend_name: str | None = None
+    embedder_options: dict[str, Any] = field(default_factory=dict, repr=False)
+    embedder: Any = field(default=None, repr=False, compare=False)
+    enforce_embedder_identity: bool = True
+
+    def __post_init__(self) -> None:
+        # Fail at construction, not on first use: an unknown name used to
+        # become "local" silently.
+        backend = resolve_embedder_backend(self.embedder_backend)
+        if backend is EmbedderBackend.EXTERNAL and self.embedder is None:
+            if not self.embedder_backend_name:
+                raise ValueError(
+                    "embedder_backend_name is required when embedder_backend is 'external'; "
+                    "set it to an embedding backend name such as 'openai' or 'name:model'"
+                )
+            parse_backend_spec(self.embedder_backend_name)
+
+
+def resolve_embedder_backend(value: str | EmbedderBackend) -> EmbedderBackend:
+    """Map a ``LocalBackendConfig.embedder_backend`` value to its enum member.
+
+    Raises:
+        ValueError: ``value`` names no embedder backend. The message lists the
+            valid names.
+    """
+    if isinstance(value, EmbedderBackend):
+        return value
+    if isinstance(value, str):
+        try:
+            return EmbedderBackend(value.strip().lower())
+        except ValueError:
+            pass
+    valid = ", ".join(repr(member.value) for member in EmbedderBackend)
+    raise ValueError(f"Unknown embedder_backend {value!r}; use one of {valid}")
 
 
 class LocalBackend:
@@ -172,22 +223,10 @@ class LocalBackend:
     async def _init_locked(self) -> None:
         """Actual init body. Must be called with ``_init_lock`` held."""
         from headroom.memory import HierarchicalMemory, MemoryConfig
-        from headroom.memory.config import EmbedderBackend
-
-        # Map string embedder_backend to enum
-        embedder_backend_map = {
-            "local": EmbedderBackend.LOCAL,
-            "onnx": EmbedderBackend.ONNX,
-            "openai": EmbedderBackend.OPENAI,
-            "ollama": EmbedderBackend.OLLAMA,
-        }
-        embedder_backend = embedder_backend_map.get(
-            self._config.embedder_backend, EmbedderBackend.LOCAL
-        )
 
         mem_config = MemoryConfig(
             db_path=Path(self._config.db_path),
-            embedder_backend=embedder_backend,
+            embedder_backend=resolve_embedder_backend(self._config.embedder_backend),
             embedder_model=self._config.embedder_model,
             vector_dimension=self._config.vector_dimension,
             openai_api_key=self._config.openai_api_key,
@@ -195,9 +234,20 @@ class LocalBackend:
             ollama_base_url=self._config.ollama_base_url,
             cache_enabled=self._config.cache_enabled,
             cache_max_size=self._config.cache_max_size,
+            embedder_backend_name=self._config.embedder_backend_name,
+            embedder_options=self._config.embedder_options,
+            embedder=self._config.embedder,
         )
 
-        self._hierarchical_memory = await HierarchicalMemory.create(mem_config)
+        hierarchical_memory = await HierarchicalMemory.create(mem_config)
+        try:
+            # Opening the store and indexes only creates missing tables; this
+            # is the first write, and it must come before any memory is saved.
+            self._verify_embedder_identity(mem_config, hierarchical_memory)
+        except Exception:
+            await hierarchical_memory.close()
+            raise
+        self._hierarchical_memory = hierarchical_memory
 
         # Choose graph store based on config
         if self._config.graph_persist:
@@ -226,6 +276,23 @@ class LocalBackend:
             logger.info("LocalBackend: Using InMemoryGraphStore (unbounded)")
 
         self._initialized = True
+
+    def _verify_embedder_identity(
+        self, mem_config: MemoryConfig, hierarchical_memory: HierarchicalMemory
+    ) -> None:
+        """Stamp the database with this embedder, or refuse one written by another."""
+        from headroom.memory.embedder_identity import (
+            embedder_identity,
+            identity_check_enabled,
+            verify_embedder_identity,
+        )
+
+        identity = embedder_identity(mem_config, hierarchical_memory.embedder)
+        verify_embedder_identity(
+            self._config.db_path,
+            identity,
+            enforce=self._config.enforce_embedder_identity and identity_check_enabled(),
+        )
 
     # =========================================================================
     # Core Memory Operations

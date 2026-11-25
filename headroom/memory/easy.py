@@ -85,6 +85,18 @@ class Memory:
         qdrant_api_key: API key for hosted Qdrant. Defaults to
             ``HEADROOM_QDRANT_API_KEY`` if unset.
         neo4j_uri: Neo4j URI (only for "qdrant-neo4j" backend).
+        embedder: Your own embedder (only for "local" backend): an async memory
+            ``Embedder``, a synchronous
+            :class:`~headroom.models.backends.EmbeddingBackend`, or a plain
+            function ``fn(list[str]) -> rows``. Wins over ``HEADROOM_EMBEDDER_*``.
+            You own its lifecycle; ``close()`` leaves it open.
+        vector_dimension: Width of the vectors the embedder produces (only for
+            "local" backend). Required when it is not 384 (the default model's).
+            Wins over ``HEADROOM_EMBEDDER_DIMENSION``.
+
+        Without ``embedder``, the "local" backend uses the embedder
+        ``HEADROOM_EMBEDDER_PROVIDER`` selects, like the proxy does, so both
+        can share a database; unset, the built-in sentence-transformers model.
 
     Examples:
         # Simplest usage - no config needed
@@ -96,6 +108,9 @@ class Memory:
 
         # Production mode with local Docker services
         memory = Memory(backend="qdrant-neo4j")
+
+        # Your own embedding function (any callable returning one row per text)
+        memory = Memory(embedder=my_model.encode, vector_dimension=768)
 
         # Hosted Qdrant via URL + API key (or set HEADROOM_QDRANT_URL /
         # HEADROOM_QDRANT_API_KEY in the environment)
@@ -117,12 +132,21 @@ class Memory:
         neo4j_uri: str = "neo4j://localhost:7687",
         neo4j_user: str = "neo4j",
         neo4j_password: str | None = None,
+        *,
+        embedder: Any = None,
+        vector_dimension: int | None = None,
     ) -> None:
         from headroom.memory import qdrant_env
 
+        if backend != "local" and (embedder is not None or vector_dimension is not None):
+            raise ValueError(
+                f"embedder and vector_dimension apply to the 'local' backend only, not {backend!r}"
+            )
         self._backend_type = backend
         self._backend: Any = None
         self._initialized = False
+        self._embedder = embedder
+        self._vector_dimension = vector_dimension
 
         # Config for local backend
         if db_path is None:
@@ -157,8 +181,16 @@ class Memory:
 
         if self._backend_type == "local":
             from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+            from headroom.memory.embedder_env import local_backend_embedder_kwargs_from_env
 
-            config = LocalBackendConfig(db_path=str(self._db_path))
+            embedder_kwargs: dict[str, Any] = (
+                {"embedder": self._embedder}
+                if self._embedder is not None
+                else local_backend_embedder_kwargs_from_env()
+            )
+            if self._vector_dimension is not None:
+                embedder_kwargs["vector_dimension"] = self._vector_dimension
+            config = LocalBackendConfig(db_path=str(self._db_path), **embedder_kwargs)
             self._backend = LocalBackend(config)
 
         elif self._backend_type == "qdrant-neo4j":
