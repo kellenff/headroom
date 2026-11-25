@@ -30,6 +30,7 @@ from headroom.memory.core import HierarchicalMemory
 from headroom.memory.embedder_identity import (
     IDENTITY_CHECK_ENV,
     EmbedderMismatchError,
+    clear_embedder_identity,
     embedder_identity,
     identity_check_enabled,
     read_embedder_identity,
@@ -104,6 +105,16 @@ def _clean_registry_and_cache(monkeypatch: pytest.MonkeyPatch):
     yield
     EMBEDDING_BACKENDS._reset_for_tests()
     _reset_embedder_cache_for_tests()
+
+
+class Masked:
+    """A credential holder whose repr hides its value, like pydantic's SecretStr."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return "Masked('**********')"
 
 
 def external(**overrides: Any) -> MemoryConfig:
@@ -240,6 +251,37 @@ class TestExternalEmbedder:
     def test_cache_key_holds_no_raw_option_values(self) -> None:
         _create_embedder(external(embedder_options={"api_key": "sk-raw-secret"}))
         assert all("sk-raw-secret" not in part for key in _EMBEDDER_CACHE for part in key)
+
+    def test_options_whose_repr_masks_them_never_share_an_embedder(self) -> None:
+        """Regression: the key used repr() for non-JSON options, and a masked
+        credential's repr is the same for every value, so tenant B got tenant
+        A's cached client and key."""
+        first = _create_embedder(external(embedder_options={"api_key": Masked("tenant-a")}))
+        second = _create_embedder(external(embedder_options={"api_key": Masked("tenant-b")}))
+        assert repr(Masked("tenant-a")) == repr(Masked("tenant-b"))
+        assert second is not first
+        assert [b.options["api_key"].value for b in FakeBackend.instances] == [
+            "tenant-a",
+            "tenant-b",
+        ]
+        # Not cached, so each memory system owns (and closes) its own.
+        assert _EMBEDDER_CACHE == {}
+        assert not embedder_is_shared(external(), first)
+
+    def test_a_pydantic_secret_is_not_cached(self) -> None:
+        secret = pytest.importorskip("pydantic").SecretStr
+        first = _create_embedder(external(embedder_options={"api_key": secret("a")}))
+        second = _create_embedder(external(embedder_options={"api_key": secret("b")}))
+        assert second is not first
+        assert second.backend.options["api_key"].get_secret_value() == "b"
+
+    async def test_an_uncached_embedder_is_owned_and_closed(self, tmp_path: Path) -> None:
+        memory = await HierarchicalMemory.create(
+            external(db_path=tmp_path / "m.db", embedder_options={"api_key": Masked("a")})
+        )
+        assert memory._owns_embedder is True
+        await memory.close()
+        assert FakeBackend.instances[0].closed == 1
 
     def test_builtin_embedders_keep_their_unchecked_dimension(self) -> None:
         # Ollama reports 768 against the 384 default index; refusing that up
@@ -465,6 +507,28 @@ class TestBackendEmbedder:
 
         assert "sk-leak" not in repr(BackendEmbedder(Leaky(dimension=3), dimension=3))
 
+    async def test_a_name_that_is_not_a_registry_name_is_never_shown(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Regression: a plugin's self-chosen ``name`` (here an endpoint with a
+        key) reached the WARNING line and the repr unvalidated."""
+
+        class EndpointNamed(FakeBackend):
+            name = "https://gw.example/v1?key=sk-live-SECRET"
+
+            def close(self) -> None:
+                raise RuntimeError("boom")
+
+        embedder = BackendEmbedder(EndpointNamed(dimension=3), dimension=3)
+        with caplog.at_level(logging.WARNING):
+            await embedder.close()
+        assert "RuntimeError" in caplog.text
+        assert "EndpointNamed" in repr(embedder) and "EndpointNamed" in caplog.text
+        assert "sk-live-SECRET" not in caplog.text
+        assert "sk-live-SECRET" not in repr(embedder)
+        # A registry-style name is still shown as is.
+        assert f"backend={FAKE!r}" in repr(BackendEmbedder(FakeBackend(dimension=3), dimension=3))
+
 
 # =============================================================================
 # Ownership: shared embedders are never closed by one memory system
@@ -576,7 +640,31 @@ class TestEmbedderIdentity:
     def test_external_identities(self) -> None:
         assert embedder_identity(external(embedder_backend_name=f"{FAKE}:m")) == f"{FAKE}:m:3"
         assert embedder_identity(external(embedder_options={"model": "m"})) == f"{FAKE}:m:3"
+        # Without the built embedder only the configured model is known.
         assert embedder_identity(external()) == f"{FAKE}::3"
+
+    def test_external_identity_is_the_model_the_backend_serves(self) -> None:
+        """Regression: an unnamed model was recorded as '', so two backend
+        defaults of the same width shared one identity."""
+        config = external()
+        assert embedder_identity(config, _create_embedder(config)) == f"{FAKE}:fake-default:3"
+
+    @pytest.mark.parametrize("options", [{}, {"model": "sentence-transformers/all-MiniLM-L6-v2"}])
+    def test_the_sentence_transformers_backend_shares_the_minilm_identity(
+        self, monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
+    ) -> None:
+        """Regression: the same MiniLM through the sentence-transformers backend
+        got another identity than ONNX and LOCAL, so it was refused."""
+        from headroom.models.config import ML_MODEL_DEFAULTS
+
+        monkeypatch.setattr(ML_MODEL_DEFAULTS, "sentence_transformer", "all-MiniLM-L6-v2")
+        config = external(
+            embedder_backend_name="sentence-transformers",
+            embedder_options=options,
+            vector_dimension=384,
+        )
+        onnx = embedder_identity(MemoryConfig(embedder_backend=EmbedderBackend.ONNX))
+        assert embedder_identity(config, _create_embedder(config)) == onnx
 
     def test_injected_identities(self) -> None:
         mine = AsyncEmbedder()
@@ -603,7 +691,64 @@ class TestEmbedderIdentity:
         message = str(error)
         assert "'a:m:3'" in message and "'b:m:3'" in message
         assert "HEADROOM_EMBEDDER_" in message and "fresh memory directory" in message
+        assert "clear_embedder_identity()" in message and f"{IDENTITY_CHECK_ENV}=0" in message
+        assert error.stored_dimension is None
         assert read_embedder_identity(db) == "a:m:3"
+
+    def test_a_wrong_record_can_be_cleared(self, tmp_path: Path) -> None:
+        db = tmp_path / "memory.db"
+        assert clear_embedder_identity(db) is None
+        assert not db.exists()
+        verify_embedder_identity(db, "a:m:3")
+        assert clear_embedder_identity(db) == "a:m:3"
+        assert read_embedder_identity(db) is None
+        assert clear_embedder_identity(db) is None
+        verify_embedder_identity(db, "b:m:3")
+        assert read_embedder_identity(db) == "b:m:3"
+
+    @staticmethod
+    def _old_database(db: Path, width: int | None) -> None:
+        """A memory store as releases before identities wrote it: no record."""
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE memories (id TEXT PRIMARY KEY, embedding BLOB)")
+            blob = None if width is None else np.ones(width, dtype=np.float32).tobytes()
+            conn.execute("INSERT INTO memories VALUES ('m1', ?)", (blob,))
+
+    def test_stored_vectors_of_another_width_are_refused_and_not_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: the first opener's identity was recorded over stored
+        vectors it could not have written, locking out the embedder that did."""
+        db = tmp_path / "memory.db"
+        self._old_database(db, width=16)
+        with pytest.raises(EmbedderMismatchError) as excinfo:
+            verify_embedder_identity(db, "a:m:3")
+        error = excinfo.value
+        assert error.stored_dimension == 16
+        assert (error.recorded, error.current) == ("unrecorded::16", "a:m:3")
+        assert "16-wide vectors" in str(error) and "Nothing was recorded" in str(error)
+        assert read_embedder_identity(db) is None
+        verify_embedder_identity(db, "writer:m:16")
+        assert read_embedder_identity(db) == "writer:m:16"
+
+    @pytest.mark.parametrize("width", [3, None])
+    def test_stored_vectors_of_the_same_width_or_none_are_adopted(
+        self, tmp_path: Path, width: int | None
+    ) -> None:
+        db = tmp_path / "memory.db"
+        self._old_database(db, width=width)
+        verify_embedder_identity(db, "a:m:3")
+        assert read_embedder_identity(db) == "a:m:3"
+
+    def test_a_disabled_check_warns_about_stored_vectors_too(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        db = tmp_path / "memory.db"
+        self._old_database(db, width=16)
+        with caplog.at_level(logging.WARNING):
+            verify_embedder_identity(db, "a:m:3", enforce=False)
+        assert "'unrecorded::16'" in caplog.text
+        assert read_embedder_identity(db) is None
 
     def test_an_existing_database_without_a_record_adopts_the_identity(
         self, tmp_path: Path
@@ -707,6 +852,96 @@ class TestLocalBackendIdentity:
         assert reader._initialized is True
         await reader.close()
         assert read_embedder_identity(db) == f"{FAKE}:written-model:3"
+
+    @staticmethod
+    def _from_env(db: Path, monkeypatch: pytest.MonkeyPatch, **env: str) -> LocalBackend:
+        """The backend a proxy, MCP server or CLI builds from HEADROOM_EMBEDDER_*."""
+        from headroom.memory.embedder_env import local_backend_embedder_kwargs_from_env
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        kwargs = local_backend_embedder_kwargs_from_env()
+        # Each open stands for another process: nothing is shared through the cache.
+        _reset_embedder_cache_for_tests()
+        return LocalBackend(LocalBackendConfig(db_path=str(db), graph_persist=False, **kwargs))
+
+    async def test_two_sentence_transformer_defaults_are_two_identities(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: with no model named, both processes recorded
+        'sentence-transformers::384' and shared one database, although
+        HEADROOM_SENTENCE_TRANSFORMER made them serve different models."""
+        from headroom.models.config import ML_MODEL_DEFAULTS
+
+        db = tmp_path / "memory.db"
+        env = {"HEADROOM_EMBEDDER_PROVIDER": "sentence-transformers"}
+        env["HEADROOM_EMBEDDER_DIMENSION"] = "384"
+        # HEADROOM_SENTENCE_TRANSFORMER is read once, at import.
+        monkeypatch.setattr(ML_MODEL_DEFAULTS, "sentence_transformer", "all-MiniLM-L6-v2")
+        first = self._from_env(db, monkeypatch, **env)
+        await first._ensure_initialized()
+        await first.close()
+        assert read_embedder_identity(db) == "sentence-transformers:all-MiniLM-L6-v2:384"
+
+        monkeypatch.setattr(ML_MODEL_DEFAULTS, "sentence_transformer", "example-org/other-embedder")
+        second = self._from_env(db, monkeypatch, **env)
+        with pytest.raises(EmbedderMismatchError) as excinfo:
+            await second._ensure_initialized()
+        assert excinfo.value.current == "sentence-transformers:example-org/other-embedder:384"
+
+    @pytest.mark.parametrize("model", [None, "sentence-transformers/all-MiniLM-L6-v2"])
+    async def test_an_onnx_database_opens_with_the_sentence_transformers_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str | None
+    ) -> None:
+        from headroom.models.config import ML_MODEL_DEFAULTS
+
+        monkeypatch.setattr(ML_MODEL_DEFAULTS, "sentence_transformer", "all-MiniLM-L6-v2")
+        db = tmp_path / "memory.db"
+        onnx = LocalBackend(
+            LocalBackendConfig(db_path=str(db), embedder_backend="onnx", graph_persist=False)
+        )
+        await onnx._ensure_initialized()
+        await onnx.close()
+
+        env = {"HEADROOM_EMBEDDER_PROVIDER": "sentence-transformers"}
+        env["HEADROOM_EMBEDDER_DIMENSION"] = "384"
+        if model is not None:
+            env["HEADROOM_EMBEDDER_MODEL"] = model
+        backend = self._from_env(db, monkeypatch, **env)
+        await backend._ensure_initialized()
+        assert backend._initialized is True
+        await backend.close()
+        assert read_embedder_identity(db) == "sentence-transformers:all-MiniLM-L6-v2:384"
+
+    async def test_an_unrecorded_database_is_not_claimed_by_a_default_opener(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: a database written before identities existed (here by a
+        16-wide embedder) was stamped by whichever process opened it first,
+        e.g. the MCP server on its ONNX default, locking out its writer."""
+        db = tmp_path / "memory.db"
+        writer_config = self._external(db, vector_dimension=16)
+        # As older releases wrote it: no record at all.
+        old = LocalBackend(replace(writer_config, enforce_embedder_identity=False))
+        await old.save_memory("User likes Python", user_id="u")
+        await old.close()
+        with sqlite3.connect(db) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert "headroom_embedder_identity" not in tables
+
+        mcp_default = LocalBackend(
+            LocalBackendConfig(db_path=str(db), embedder_backend="onnx", graph_persist=False)
+        )
+        with pytest.raises(EmbedderMismatchError) as excinfo:
+            await mcp_default._ensure_initialized()
+        assert excinfo.value.stored_dimension == 16
+        assert read_embedder_identity(db) is None
+
+        writer = LocalBackend(writer_config)
+        results = await writer.search_memories("python", user_id="u", top_k=1)
+        assert results[0].memory.content == "User likes Python"
+        await writer.close()
+        assert read_embedder_identity(db) == f"{FAKE}:written-model:16"
 
 
 # =============================================================================

@@ -149,6 +149,9 @@ async def test_an_embedder_mismatch_is_a_configuration_error(
     assert calls == [1]
     assert "shared-fake:first-model:3" in (reader.init_error or "")
     assert "shared-fake:second-model:3" in (reader.init_error or "")
+    # The recovery steps come last; the bound must not cut them off.
+    assert "clear_embedder_identity()" in (reader.init_error or "")
+    assert (reader.init_error or "").endswith("HEADROOM_EMBEDDER_IDENTITY_CHECK=0 skips the check.")
 
 
 async def test_a_transient_failure_is_retried_and_the_shared_embedder_survives(

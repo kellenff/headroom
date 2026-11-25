@@ -179,7 +179,9 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
     :mod:`headroom.models.backends` registry. Its model comes only from
     ``embedder_backend_name`` (``"name:model"``) or ``embedder_options["model"]``;
     ``embedder_model`` is ignored, because it always holds a MiniLM default that
-    would otherwise be sent to whichever backend was chosen.
+    would otherwise be sent to whichever backend was chosen. It is cached only
+    when ``embedder_options`` are plain JSON values; an option such as a
+    ``SecretStr`` gets an uncached embedder that its memory system owns.
 
     Only EXTERNAL and injected embedders are checked against
     ``vector_dimension`` up front. The built-in embedders keep their historical
@@ -319,40 +321,67 @@ def _external_embedder(config: MemoryConfig) -> Embedder:
         for key, value in config.embedder_options.items()
         if key not in ("model", "dimension")
     }
+    digest = _options_digest(options)
+    if digest is None:
+        # An option that is not plain JSON (a SecretStr, a client object) has
+        # no faithful key: repr() masks credentials, so two configs would
+        # collide. Build one the memory system owns instead of sharing it.
+        logger.debug("Memory: embedder_options are not plain JSON; the embedder is not cached")
+        return _build_external_embedder(config, name, model, options)
+
     key = (
         EmbedderBackend.EXTERNAL.value,
         name,
         model or "",
         str(config.vector_dimension),
         # Options carry endpoints and credentials: two configs that differ in
-        # any of them must not share a client. Hashed, so the key never holds
-        # a raw credential longer than the options themselves do.
-        hashlib.sha256(
-            json.dumps(options, sort_keys=True, default=repr).encode("utf-8")
-        ).hexdigest(),
+        # any of them must not share a client.
+        digest,
     )
 
     with _EMBEDDER_CACHE_LOCK:
         cached = _EMBEDDER_CACHE.get(key)
         if cached is not None:
             return cached
-
-        from headroom.memory.adapters.backend_embedder import BackendEmbedder
-        from headroom.models.backends import create_embedding_backend
-
-        backend = create_embedding_backend(
-            name, **options, model=model, dimension=config.vector_dimension
-        )
-        try:
-            _check_declared_dimension(
-                backend.dimension, config.vector_dimension, f"Embedding backend {name!r}"
-            )
-        except ValueError:
-            _close_quietly(backend)
-            raise
-        embedder: Embedder = BackendEmbedder(backend, dimension=config.vector_dimension)
+        embedder = _build_external_embedder(config, name, model, options)
         _EMBEDDER_CACHE[key] = embedder
         return embedder
+
+
+def _options_digest(options: dict[str, Any]) -> str | None:
+    """A hash of ``options`` as strict JSON, or ``None`` if any value is not JSON.
+
+    Hashed, so the cache key never holds a raw credential longer than the
+    options themselves do.
+    """
+
+    def _not_json(value: object) -> object:
+        raise TypeError("not a JSON value")
+
+    try:
+        encoded = json.dumps(options, sort_keys=True, default=_not_json)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_external_embedder(
+    config: MemoryConfig, name: str, model: str | None, options: dict[str, Any]
+) -> Embedder:
+    from headroom.memory.adapters.backend_embedder import BackendEmbedder
+    from headroom.models.backends import create_embedding_backend
+
+    backend = create_embedding_backend(
+        name, **options, model=model, dimension=config.vector_dimension
+    )
+    try:
+        _check_declared_dimension(
+            backend.dimension, config.vector_dimension, f"Embedding backend {name!r}"
+        )
+    except ValueError:
+        _close_quietly(backend)
+        raise
+    return BackendEmbedder(backend, dimension=config.vector_dimension)
 
 
 def _close_quietly(backend: object) -> None:

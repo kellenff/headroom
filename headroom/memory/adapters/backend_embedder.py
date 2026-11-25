@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from headroom.log_safety import describe_class, describe_exception
 from headroom.memory.adapters.embedders import _resolve_embed_concurrency
 from headroom.models.backends import embed_texts
+from headroom.models.backends.embedding import _backend_label
 
 if TYPE_CHECKING:
     import numpy as np
@@ -132,7 +133,7 @@ class BackendEmbedder:
             logger.debug("Embedding backend close failed: %s", describe_exception(exc))
             logger.warning(
                 "Memory: closing embedding backend %r failed (%s)",
-                getattr(self._backend, "name", "?"),
+                _backend_label(self._backend),
                 describe_class(type(exc)),
             )
 
@@ -168,10 +169,9 @@ class BackendEmbedder:
                 raise
 
     def __repr__(self) -> str:
-        # Not the backend's own repr: a third-party one may include its options.
-        name = getattr(self._backend, "name", None)
-        label = name if isinstance(name, str) else describe_class(type(self._backend))
+        # Not the backend's own repr, nor a name that is not a registry name: a
+        # third-party one may carry its options (an endpoint, a key).
         return (
-            f"BackendEmbedder(backend={label!r}, model={self.model_name!r}, "
+            f"BackendEmbedder(backend={_backend_label(self._backend)!r}, model={self.model_name!r}, "
             f"dimension={self._dimension})"
         )
