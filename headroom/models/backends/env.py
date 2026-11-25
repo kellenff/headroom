@@ -1,23 +1,32 @@
-"""Environment-variable configuration for model backends.
+"""Environment-variable selection of embedding backends, for proxy operators.
 
 Proxy operators have no Python surface, so each consumer reads one family of
-variables under a prefix. For prefix ``HEADROOM_RELEVANCE_EMBEDDING``:
+variables under a prefix. Memory uses ``HEADROOM_EMBEDDER``; relevance scoring
+uses ``HEADROOM_RELEVANCE_EMBEDDER``. For prefix ``P``:
 
-==========================================  ==========================================
-``HEADROOM_RELEVANCE_EMBEDDING_BACKEND``    Backend spec, ``name`` or ``name:model``.
-                                            Unset or blank: the consumer's default.
-``HEADROOM_RELEVANCE_EMBEDDING_MODEL``      Model id (overrides a model in the spec).
-``HEADROOM_RELEVANCE_EMBEDDING_BASE_URL``   ``base_url`` option (remote backends).
-``HEADROOM_RELEVANCE_EMBEDDING_API_KEY``    ``api_key`` option.
-``HEADROOM_RELEVANCE_EMBEDDING_DIMENSION``  ``dimension`` option, a positive integer.
-``HEADROOM_RELEVANCE_EMBEDDING_HEADERS``    ``headers`` option, ``k=v,k2=v2``.
-``HEADROOM_RELEVANCE_EMBEDDING_OPTIONS``    JSON object of any further options. The
-                                            dedicated variables above win over keys
-                                            repeated here.
-==========================================  ==========================================
+=================  ==============================================================
+``P_PROVIDER``     Registry name of the backend (``openai``, ``fastembed``, a
+                   plugin's entry-point name). Unset or blank: the consumer's
+                   built-in default. Must be a plain name; set the model with
+                   ``P_MODEL``.
+``P_MODEL``        Model id passed as the ``model`` option.
+``P_BASE_URL``     ``base_url`` option (remote backends).
+``P_API_KEY``      ``api_key`` option.
+``P_DIMENSION``    ``dimension`` option, a positive integer. Memory requires it.
+``P_HEADERS``      ``headers`` option, as ``Name=value`` pairs separated by commas.
+                   Values cannot contain commas; use ``P_OPTIONS`` for those.
+``P_OPTIONS``      JSON object of further options. The dedicated variables above
+                   win over the same keys here; ``model`` is not accepted here.
+=================  ==============================================================
 
-Values that fail to parse raise ``ValueError`` naming the variable; the values
-of ``_API_KEY``, ``_HEADERS`` and ``_OPTIONS`` are never echoed.
+Two shortcuts keep the common cases to one variable:
+
+* ``HEADROOM_EMBEDDER_RUNTIME=openai`` (the spelling from the first custom-API
+  release) is an alias for ``HEADROOM_EMBEDDER_PROVIDER=openai``.
+* ``HEADROOM_RELEVANCE_EMBEDDER_PROVIDER=memory`` reuses the memory embedder's
+  ``HEADROOM_EMBEDDER_*`` settings, so one server and one key serve both.
+
+Malformed values raise ``ValueError`` naming the variable, never its value.
 """
 
 from __future__ import annotations
@@ -28,29 +37,40 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from .embedding import EmbeddingBackend, create_embedding_backend
-from .registry import parse_backend_spec
+from .embedding import EMBEDDING_BACKENDS, EmbeddingBackend, create_embedding_backend
+from .registry import NAME_RE, UnknownBackendError
 
-#: Prefix for the memory embedder variables (``HEADROOM_EMBEDDER_BACKEND`` ...).
+#: Prefix for the memory embedder variables (``HEADROOM_EMBEDDER_PROVIDER`` ...).
 MEMORY_EMBEDDER_ENV_PREFIX = "HEADROOM_EMBEDDER"
-#: Prefix for the relevance-scoring variables (``HEADROOM_RELEVANCE_EMBEDDING_BACKEND`` ...).
-RELEVANCE_EMBEDDING_ENV_PREFIX = "HEADROOM_RELEVANCE_EMBEDDING"
+#: Prefix for the relevance-scoring variables (``HEADROOM_RELEVANCE_EMBEDDER_PROVIDER`` ...).
+RELEVANCE_EMBEDDER_ENV_PREFIX = "HEADROOM_RELEVANCE_EMBEDDER"
+#: ``HEADROOM_RELEVANCE_EMBEDDER_PROVIDER`` value that reuses the memory settings.
+REUSE_MEMORY_EMBEDDER = "memory"
+#: The memory runtime variable. ``openai`` is an alias for the ``openai`` provider;
+#: its other values (``cpu``, ``pytorch_mps``) pick a device for the built-in model.
+MEMORY_EMBEDDER_RUNTIME_ENV = "HEADROOM_EMBEDDER_RUNTIME"
+
+_COMPANIONS = ("MODEL", "BASE_URL", "API_KEY", "DIMENSION", "HEADERS", "OPTIONS")
 
 
-def parse_header_pairs(raw: str | None) -> dict[str, str]:
-    """Parse ``k=v,k2=v2`` into a dict.
+def parse_header_pairs(raw: str, var: str) -> dict[str, str]:
+    """Parse ``Name=value,Name2=value2`` strictly.
 
-    Same format as ``HEADROOM_KOMPRESS_ENDPOINT_HEADERS``. Malformed pairs are skipped.
+    Raises:
+        ValueError: A pair is malformed. The message names ``var`` only.
     """
     pairs: dict[str, str] = {}
-    for item in (raw or "").split(","):
+    for item in raw.split(","):
         part = item.strip()
-        if not part or "=" not in part:
+        if not part:
             continue
-        key, _, value = part.partition("=")
+        key, sep, value = part.partition("=")
         key, value = key.strip(), value.strip()
-        if key and value:
-            pairs[key] = value
+        if not sep or not key or not value or any(ch in key + value for ch in "\r\n\x00"):
+            raise ValueError(f"{var} must hold Name=value pairs separated by commas")
+        pairs[key] = value
+    if not pairs:
+        raise ValueError(f"{var} must hold Name=value pairs separated by commas")
     return pairs
 
 
@@ -63,7 +83,7 @@ class EmbeddingBackendSettings:
         model: Model id, or ``None`` for the backend's default.
         options: Further constructor options (``base_url``, ``api_key``, ...).
             Excluded from ``repr`` because they can hold credentials.
-        source: The ``*_BACKEND`` variable this came from, for messages.
+        source: The variable that selected the backend, for messages.
     """
 
     name: str
@@ -83,8 +103,31 @@ class EmbeddingBackendSettings:
             options["model"] = self.model
         return options
 
+    def identity(self) -> str:
+        """A stable, credential-free label for the embedding space: ``name:model``."""
+        return f"{self.name}:{self.model or ''}"
+
+    def validate(self) -> None:
+        """Check the backend name resolves, without constructing it.
+
+        Raises:
+            UnknownBackendError: No backend has this name (the message names
+                :attr:`source`, not the value).
+            BackendLoadError: The backend's factory could not be imported.
+        """
+        try:
+            EMBEDDING_BACKENDS.get_factory(self.name)
+        except UnknownBackendError:
+            raise UnknownBackendError(
+                f"{self.source or 'The configured provider'} does not name a known embedding "
+                f"backend. Available: {', '.join(EMBEDDING_BACKENDS.names()) or '(none)'}. "
+                f"A plugin must be installed and registered under "
+                f"'{EMBEDDING_BACKENDS.entry_point_group}'."
+            ) from None
+
     def create(self) -> EmbeddingBackend:
-        """Construct the backend."""
+        """Validate the name, then construct the backend."""
+        self.validate()
         return create_embedding_backend(self.name, **self.backend_options())
 
 
@@ -92,36 +135,22 @@ def _positive_int(raw: str, var: str) -> int:
     try:
         value = int(raw.strip())
     except ValueError:
-        raise ValueError(f"{var} must be a positive integer, got {raw!r}") from None
+        raise ValueError(f"{var} must be a positive integer") from None
     if value < 1:
-        raise ValueError(f"{var} must be a positive integer, got {raw!r}")
+        raise ValueError(f"{var} must be a positive integer")
     return value
 
 
-def embedding_backend_settings_from_env(
-    prefix: str,
-    env: Mapping[str, str] | None = None,
-) -> EmbeddingBackendSettings | None:
-    """Read ``{prefix}_BACKEND`` and its companion variables.
+def _get(env: Mapping[str, str], var: str) -> str:
+    return (env.get(var) or "").strip()
 
-    Returns ``None`` when ``{prefix}_BACKEND`` is unset or blank.
 
-    Raises:
-        ValueError: A variable is malformed.
-    """
-    env = os.environ if env is None else env
-    spec_var = f"{prefix}_BACKEND"
-    spec = (env.get(spec_var) or "").strip()
-    if not spec:
-        return None
-    try:
-        name, model = parse_backend_spec(spec)
-    except ValueError as exc:
-        raise ValueError(f"{spec_var}: {exc}") from None
-
+def _read_family(
+    prefix: str, name: str, source: str, env: Mapping[str, str]
+) -> EmbeddingBackendSettings:
     options: dict[str, Any] = {}
     options_var = f"{prefix}_OPTIONS"
-    raw_options = (env.get(options_var) or "").strip()
+    raw_options = _get(env, options_var)
     if raw_options:
         try:
             parsed = json.loads(raw_options)
@@ -129,30 +158,110 @@ def embedding_backend_settings_from_env(
             raise ValueError(f"{options_var} must be a JSON object") from None
         if not isinstance(parsed, dict):
             raise ValueError(f"{options_var} must be a JSON object")
+        if "model" in parsed:
+            raise ValueError(f"{options_var} must not set 'model'; use {prefix}_MODEL")
         options.update(parsed)
-    if "model" in options:
-        option_model = options.pop("model")
-        if model is None and isinstance(option_model, str) and option_model.strip():
-            model = option_model.strip()
 
-    model_override = (env.get(f"{prefix}_MODEL") or "").strip()
-    if model_override:
-        model = model_override
-
-    base_url = (env.get(f"{prefix}_BASE_URL") or "").strip()
-    if base_url:
+    model = _get(env, f"{prefix}_MODEL") or None
+    if base_url := _get(env, f"{prefix}_BASE_URL"):
         options["base_url"] = base_url
-    api_key = (env.get(f"{prefix}_API_KEY") or "").strip()
-    if api_key:
+    if api_key := _get(env, f"{prefix}_API_KEY"):
         options["api_key"] = api_key
-    dimension = (env.get(f"{prefix}_DIMENSION") or "").strip()
-    if dimension:
+    if dimension := _get(env, f"{prefix}_DIMENSION"):
         options["dimension"] = _positive_int(dimension, f"{prefix}_DIMENSION")
-    headers_var = f"{prefix}_HEADERS"
-    if (env.get(headers_var) or "").strip():
-        headers = parse_header_pairs(env.get(headers_var))
-        if not headers:
-            raise ValueError(f"{headers_var} must hold k=v pairs separated by commas")
-        options["headers"] = headers
+    if headers := _get(env, f"{prefix}_HEADERS"):
+        options["headers"] = parse_header_pairs(headers, f"{prefix}_HEADERS")
+    return EmbeddingBackendSettings(name=name, model=model, options=options, source=source)
 
-    return EmbeddingBackendSettings(name=name, model=model, options=options, source=spec_var)
+
+def _provider_name(raw: str, var: str, prefix: str) -> str:
+    name = raw.strip().lower()
+    if ":" in name:
+        raise ValueError(f"{var} must be a backend name only; set the model with {prefix}_MODEL")
+    if not NAME_RE.match(name):
+        raise ValueError(
+            f"{var} must be a backend name: lower-case letters, digits, '.', '_' or '-'"
+        )
+    return name
+
+
+def embedding_backend_settings_from_env(
+    prefix: str,
+    env: Mapping[str, str] | None = None,
+) -> EmbeddingBackendSettings | None:
+    """Read ``{prefix}_PROVIDER`` and its companion variables.
+
+    Returns ``None`` when ``{prefix}_PROVIDER`` is unset or blank.
+
+    Raises:
+        ValueError: A variable is malformed.
+    """
+    env = os.environ if env is None else env
+    var = f"{prefix}_PROVIDER"
+    raw = _get(env, var)
+    if not raw:
+        return None
+    return _read_family(prefix, _provider_name(raw, var, prefix), var, env)
+
+
+def memory_embedder_settings_from_env(
+    env: Mapping[str, str] | None = None,
+) -> EmbeddingBackendSettings | None:
+    """The memory embedder selected by ``HEADROOM_EMBEDDER_*``, or ``None`` for the default.
+
+    ``HEADROOM_EMBEDDER_RUNTIME=openai`` selects the ``openai`` provider. Any
+    other runtime value (``cpu``, ``pytorch_mps``) configures the built-in local
+    embedder and cannot be combined with ``HEADROOM_EMBEDDER_PROVIDER``.
+
+    Raises:
+        ValueError: A variable is malformed or the variables contradict each other.
+    """
+    env = os.environ if env is None else env
+    prefix = MEMORY_EMBEDDER_ENV_PREFIX
+    runtime = _get(env, MEMORY_EMBEDDER_RUNTIME_ENV).lower()
+    settings = embedding_backend_settings_from_env(prefix, env)
+    if runtime == "openai":
+        if settings is not None and settings.name != "openai":
+            raise ValueError(
+                f"{MEMORY_EMBEDDER_RUNTIME_ENV}=openai contradicts {prefix}_PROVIDER; "
+                f"set only {prefix}_PROVIDER"
+            )
+        if settings is None:
+            settings = _read_family(prefix, "openai", f"{MEMORY_EMBEDDER_RUNTIME_ENV}=openai", env)
+    elif settings is not None and runtime not in ("", "cpu"):
+        raise ValueError(
+            f"{MEMORY_EMBEDDER_RUNTIME_ENV} picks the device for the built-in embedder and "
+            f"cannot be combined with {prefix}_PROVIDER; unset one of them"
+        )
+    return settings
+
+
+def relevance_embedder_settings_from_env(
+    env: Mapping[str, str] | None = None,
+) -> EmbeddingBackendSettings | None:
+    """The relevance-scoring backend selected by ``HEADROOM_RELEVANCE_EMBEDDER_*``.
+
+    ``HEADROOM_RELEVANCE_EMBEDDER_PROVIDER=memory`` returns the memory embedder's
+    settings; its companion variables must then be unset.
+
+    Raises:
+        ValueError: A variable is malformed, or ``memory`` is selected while no
+            memory provider is configured.
+    """
+    env = os.environ if env is None else env
+    prefix = RELEVANCE_EMBEDDER_ENV_PREFIX
+    var = f"{prefix}_PROVIDER"
+    raw = _get(env, var)
+    if raw.lower() != REUSE_MEMORY_EMBEDDER:
+        return embedding_backend_settings_from_env(prefix, env)
+    stray = [f"{prefix}_{name}" for name in _COMPANIONS if _get(env, f"{prefix}_{name}")]
+    if stray:
+        raise ValueError(
+            f"{var}=memory reuses the HEADROOM_EMBEDDER_* settings; unset {', '.join(stray)}"
+        )
+    settings = memory_embedder_settings_from_env(env)
+    if settings is None:
+        raise ValueError(
+            f"{var}=memory needs a memory embedder provider (HEADROOM_EMBEDDER_PROVIDER)"
+        )
+    return settings

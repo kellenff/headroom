@@ -30,7 +30,12 @@ indexes. :class:`~headroom.offline.OfflineEgressBlocked` is never wrapped. It is
 a ``BaseException`` by design and passes through unchanged.
 
 Error messages name the kind and the backend, never the options, because
-options routinely carry API keys.
+options routinely carry API keys. For third-party factories they also leave out
+the exception's own text, which can echo a credential-bearing URL or key; only
+its class is named, the original stays chained (``raise ... from exc``), and the
+detail is logged at DEBUG through :func:`headroom.log_safety.describe_exception`.
+Headroom's own built-ins are trusted to word their errors safely, so their
+messages are kept.
 """
 
 from __future__ import annotations
@@ -42,6 +47,8 @@ import threading
 from collections.abc import Callable
 from importlib.metadata import EntryPoint, entry_points
 from typing import Any, Generic, TypeVar, cast
+
+from headroom.log_safety import describe_class, describe_exception
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +100,12 @@ def parse_backend_spec(spec: str) -> tuple[str, str | None]:
     validate_backend_name(name)
     model_part = model.strip() if sep else ""
     return name, (model_part or None)
+
+
+def _dist_name(ep: EntryPoint) -> str:
+    dist = getattr(ep, "dist", None)
+    name = getattr(dist, "name", None) if dist is not None else None
+    return name if isinstance(name, str) and name else ep.value
 
 
 def _import_target(target: str) -> Any:
@@ -209,17 +222,19 @@ class BackendRegistry(Generic[T]):
 
         Raises:
             UnknownBackendError: Nothing is selectable under ``name``.
-            BackendLoadError: The factory could not be imported.
+            BackendLoadError: The factory could not be imported, or more than one
+                installed distribution registers ``name``.
         """
         with self._lock:
             cached = self._loaded.get(name)
             if cached is not None:
                 return cached
             source: Callable[..., T] | str | None = self._registered.get(name)
+            trusted = source is None and name in self._builtins
             if source is None:
                 source = self._builtins.get(name)
             if source is not None:
-                factory = self._resolve(name, source)
+                factory = self._resolve(name, source, trusted=trusted)
                 self._loaded[name] = factory
                 return factory
 
@@ -233,19 +248,30 @@ class BackendRegistry(Generic[T]):
         try:
             loaded = ep.load()
         except Exception as exc:
+            logger.debug(
+                "Loading %s backend entry point %r failed: %s",
+                self.kind,
+                name,
+                describe_exception(exc),
+            )
             raise BackendLoadError(
                 f"Could not load {self.kind} backend {name!r} from entry point "
-                f"{ep.value!r}: {type(exc).__name__}: {exc}"
+                f"{ep.value!r} ({describe_class(type(exc))})"
             ) from exc
         if not callable(loaded):
             raise BackendLoadError(
                 f"Entry point {name!r} in '{self.entry_point_group}' is not callable "
-                f"(got {type(loaded).__name__}); it must be a backend class or factory."
+                f"(got {describe_class(type(loaded))}); it must be a backend class or factory."
             )
         factory = cast("Callable[..., T]", loaded)
         with self._lock:
             # A registration may have raced us while the entry point was loading.
             return self._loaded.setdefault(name, factory)
+
+    def is_builtin(self, name: str) -> bool:
+        """Whether ``name`` currently resolves to a Headroom built-in."""
+        with self._lock:
+            return name in self._builtins and name not in self._registered
 
     def create(self, name: str, /, **options: Any) -> T:
         """Construct the backend registered under ``name`` with ``options``.
@@ -253,7 +279,8 @@ class BackendRegistry(Generic[T]):
         Raises:
             UnknownBackendError: Nothing is selectable under ``name``.
             BackendLoadError: The factory raised. The original exception is
-                chained; the message never includes ``options``.
+                chained; the message never includes ``options``, nor a
+                third-party factory's own error text.
         """
         factory = self.get_factory(name)
         try:
@@ -261,8 +288,18 @@ class BackendRegistry(Generic[T]):
         except BackendError:
             raise
         except Exception as exc:
+            if self.is_builtin(name):
+                detail = f"{type(exc).__name__}: {exc}"
+            else:
+                logger.debug(
+                    "%s backend %r failed to initialise: %s",
+                    self.kind,
+                    name,
+                    describe_exception(exc),
+                )
+                detail = describe_class(type(exc))
             raise BackendLoadError(
-                f"{self.kind} backend {name!r} failed to initialise: {type(exc).__name__}: {exc}"
+                f"{self.kind} backend {name!r} failed to initialise ({detail})"
             ) from exc
 
     # ------------------------------------------------------------------ internals
@@ -272,25 +309,27 @@ class BackendRegistry(Generic[T]):
         if not matches:
             return None
         if len(matches) > 1:
-            logger.warning(
-                "%d packages register a %s backend named %r under %s; using %s.",
-                len(matches),
-                self.kind,
-                name,
-                self.entry_point_group,
-                matches[0].value,
+            # Fail closed: picking one by metadata order would let installing a
+            # second package change which code runs for an operator's selection.
+            dists = sorted({_dist_name(ep) for ep in matches})
+            raise BackendLoadError(
+                f"{len(matches)} installed packages register a {self.kind} backend named "
+                f"{name!r} under '{self.entry_point_group}' ({', '.join(dists)}). Uninstall "
+                "all but one, or register the one you want programmatically under another name."
             )
         return matches[0]
 
-    def _resolve(self, name: str, source: Callable[..., T] | str) -> Callable[..., T]:
+    def _resolve(
+        self, name: str, source: Callable[..., T] | str, *, trusted: bool
+    ) -> Callable[..., T]:
         if not isinstance(source, str):
             return source
         try:
             target = _import_target(source)
         except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}" if trusted else describe_class(type(exc))
             raise BackendLoadError(
-                f"Could not import {self.kind} backend {name!r} ({source}): "
-                f"{type(exc).__name__}: {exc}"
+                f"Could not import {self.kind} backend {name!r} ({source}): {detail}"
             ) from exc
         if not callable(target):
             raise BackendLoadError(f"{self.kind} backend {name!r} ({source}) is not callable")

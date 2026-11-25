@@ -32,9 +32,22 @@ Obligations a backend must meet:
 * Determinism for a given model. Memory persists the vectors and relevance
   thresholds assume a stable score distribution.
 * Air-gap compliance. A backend that opens network connections must call
-  :func:`headroom.offline.guard_egress` before it builds its client. The
-  built-in ``openai`` backend does; Headroom cannot enforce it for third-party
-  code.
+  :func:`headroom.offline.guard_egress` in its constructor, so an air-gapped
+  process refuses at startup, and again before each request. The built-in
+  ``openai`` backend does; Headroom cannot enforce it for third-party code.
+* Recoverable ``close()``. Headroom shares one backend between many users and
+  may call ``close()`` while others still hold it. ``close()`` must be
+  idempotent and a later ``embed`` must work (re-open lazily).
+* Safe errors. Headroom logs only the class of an exception raised by a
+  third-party backend, not its message, unless ``HEADROOM_DEBUG_DUMP=full``.
+
+Factories
+---------
+A backend is built by a factory: a class or function called with keyword
+options. Every factory must accept the keywords ``model`` (``str | None``) and
+``dimension`` (``int | None``), even if it ignores them: Headroom passes the
+model the operator chose and, for memory, the vector index's dimension. Other
+options are whatever the factory documents (``base_url``, ``api_key``, ...).
 
 Registering a backend
 ---------------------
@@ -55,20 +68,36 @@ accepted and it is wrapped in :class:`CallableEmbeddingBackend`.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from headroom.log_safety import describe_class, describe_exception
+
+from .registry import NAME_RE as _SAFE_LABEL_RE
 from .registry import BackendError, BackendRegistry, parse_backend_spec
 
 if TYPE_CHECKING:
     import numpy as np
+
+logger = logging.getLogger(__name__)
 
 EMBEDDING_ENTRY_POINT_GROUP = "headroom.embedding_backend"
 
 
 class EmbeddingBackendResponseError(BackendError, ValueError):
     """A backend returned rows that do not match the request (count, width, finiteness)."""
+
+
+class EmbeddingBackendCallError(BackendError):
+    """A backend's ``embed`` raised.
+
+    For third-party backends the message names only the exception class; the
+    original is chained. Errors that are already :class:`BackendError`
+    subclasses (raised by Headroom's own built-ins, with messages written to be
+    safe to log) pass through unchanged.
+    """
 
 
 @runtime_checkable
@@ -183,7 +212,10 @@ def _positive_int_or_none(value: Any, field: str) -> int | None:
 
 
 def _backend_label(backend: object) -> str:
-    return str(getattr(backend, "name", type(backend).__name__))
+    name = getattr(backend, "name", None)
+    if isinstance(name, str) and _SAFE_LABEL_RE.match(name):
+        return name
+    return describe_class(type(backend))
 
 
 def embed_texts(
@@ -238,7 +270,7 @@ def embed_texts(
     chunks: list[np.ndarray] = []
     for start in range(0, len(indices), batch):
         sent = [texts[i] for i in indices[start : start + batch]]
-        rows = _as_matrix(backend.embed(sent), label)
+        rows = _as_matrix(_call_embed(backend, sent, label), label)
         if rows.shape[0] != len(sent):
             raise EmbeddingBackendResponseError(
                 f"Embedding backend {label!r} returned {rows.shape[0]} vectors for {len(sent)} texts"
@@ -263,6 +295,18 @@ def embed_texts(
         norms = np.linalg.norm(out, axis=1, keepdims=True)
         out = (out / np.where(norms > 0, norms, 1.0)).astype(np.float32)
     return out
+
+
+def _call_embed(backend: EmbeddingBackend, texts: list[str], label: str) -> Any:
+    try:
+        return backend.embed(texts)
+    except BackendError:
+        raise
+    except Exception as exc:
+        logger.debug("Embedding backend %r failed: %s", label, describe_exception(exc))
+        raise EmbeddingBackendCallError(
+            f"Embedding backend {label!r} failed ({describe_class(type(exc))})"
+        ) from exc
 
 
 def _as_matrix(rows: Any, label: str) -> np.ndarray:

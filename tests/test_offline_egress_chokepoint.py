@@ -3068,6 +3068,7 @@ class TestEgressChokepointCoverage:
             "onnx_runtime.py",
             "tokenizers/huggingface.py",
             "evals/datasets.py",
+            "models/backends/openai_compat.py",
         ):
             assert relpath in sites, f"{relpath} has no detected egress site at all"
             assert any(site.guarded for site in sites[relpath]), (

@@ -25,6 +25,7 @@ from .embedding import (
     EMBEDDING_ENTRY_POINT_GROUP,
     CallableEmbeddingBackend,
     EmbeddingBackend,
+    EmbeddingBackendCallError,
     EmbeddingBackendResponseError,
     as_embedding_backend,
     available_embedding_backends,
@@ -35,9 +36,11 @@ from .embedding import (
 )
 from .env import (
     MEMORY_EMBEDDER_ENV_PREFIX,
-    RELEVANCE_EMBEDDING_ENV_PREFIX,
+    RELEVANCE_EMBEDDER_ENV_PREFIX,
     EmbeddingBackendSettings,
     embedding_backend_settings_from_env,
+    memory_embedder_settings_from_env,
+    relevance_embedder_settings_from_env,
 )
 from .registry import (
     BackendError,
@@ -59,6 +62,7 @@ __all__ = [
     "EMBEDDING_ENTRY_POINT_GROUP",
     "CallableEmbeddingBackend",
     "EmbeddingBackend",
+    "EmbeddingBackendCallError",
     "EmbeddingBackendResponseError",
     "as_embedding_backend",
     "available_embedding_backends",
@@ -68,7 +72,9 @@ __all__ = [
     "unregister_embedding_backend",
     # env
     "MEMORY_EMBEDDER_ENV_PREFIX",
-    "RELEVANCE_EMBEDDING_ENV_PREFIX",
+    "RELEVANCE_EMBEDDER_ENV_PREFIX",
     "EmbeddingBackendSettings",
     "embedding_backend_settings_from_env",
+    "memory_embedder_settings_from_env",
+    "relevance_embedder_settings_from_env",
 ]

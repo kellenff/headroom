@@ -5,11 +5,16 @@ that speak the same wire format: vLLM, Hugging Face TEI, LM Studio, llama.cpp,
 LocalAI, Ollama's ``/v1`` endpoint and most gateways. It needs only ``httpx``,
 a core dependency, and not the ``openai`` SDK.
 
-Air gap: the client is built only after :func:`headroom.offline.guard_egress`,
-which also runs at construction so an air-gapped process refuses at startup
-rather than on the first request. Loopback endpoints are not exempt, matching
-the policy documented on ``guard_egress``: with ``HEADROOM_OFFLINE`` set, use a
-local model backend instead.
+Air gap: :func:`headroom.offline.guard_egress` runs at construction, so an
+air-gapped process refuses at startup rather than on the first request, before
+the HTTP client is built, and before every request. Loopback endpoints are not
+exempt, matching the policy documented on ``guard_egress``: with
+``HEADROOM_OFFLINE`` set, use a local model backend instead.
+
+Ambient configuration is deliberately ignored: ``OPENAI_BASE_URL`` is never
+read (``headroom wrap`` points it at the Headroom proxy itself), and
+``OPENAI_API_KEY`` is used only when the endpoint is api.openai.com, so an
+OpenAI key is never sent to another host.
 """
 
 from __future__ import annotations
@@ -24,9 +29,16 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from headroom.log_safety import content_logging_enabled
 from headroom.offline import guard_egress
 
 from .embedding import EmbeddingBackendResponseError, _positive_int_or_none
+from .registry import BackendError
+
+
+class EmbeddingBackendRequestError(BackendError, ConnectionError):
+    """The embedding API could not be reached, or answered with an HTTP error."""
+
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +84,11 @@ class OpenAICompatibleEmbeddingBackend:
         model: Model id sent to the server. Required unless the endpoint is
             OpenAI's own, where it defaults to ``text-embedding-3-small``.
         base_url: API root including any ``/v1`` prefix. Defaults to
-            ``OPENAI_BASE_URL``, then ``https://api.openai.com/v1``.
-        api_key: Sent as ``Authorization: Bearer``. When ``base_url`` is not
-            given, falls back to ``OPENAI_API_KEY`` (the OpenAI SDK's convention).
-            An explicit ``base_url`` never picks up ``OPENAI_API_KEY``, so an
-            OpenAI key is not sent to some other host by accident. Omit it for
-            unauthenticated local servers.
+            ``https://api.openai.com/v1``. ``OPENAI_BASE_URL`` is not read.
+        api_key: Sent as ``Authorization: Bearer``. For api.openai.com it falls
+            back to ``OPENAI_API_KEY`` and is required; for any other host it is
+            optional (omit it for unauthenticated local servers) and never taken
+            from the environment.
         dimension: Expected output width. Every response is checked against it.
             Memory requires it; relevance learns it from the first response.
         request_dimensions: Also send ``"dimensions": dimension`` in the request,
@@ -108,12 +119,7 @@ class OpenAICompatibleEmbeddingBackend:
         max_batch_size: int = 256,
         max_tokens: int = 8191,
     ) -> None:
-        explicit_base = bool(base_url and base_url.strip())
-        resolved = (
-            base_url.strip()
-            if base_url and base_url.strip()
-            else os.environ.get("OPENAI_BASE_URL", "").strip() or DEFAULT_BASE_URL
-        )
+        resolved = base_url.strip() if base_url and base_url.strip() else DEFAULT_BASE_URL
         self.base_url = _validate_base_url(resolved)
         self.host = urlsplit(self.base_url).hostname or ""
         is_openai = self.host == _OPENAI_HOST
@@ -127,9 +133,11 @@ class OpenAICompatibleEmbeddingBackend:
             model = DEFAULT_OPENAI_MODEL
         self.model_name = model
 
-        if api_key is None and not explicit_base:
+        if api_key is None and is_openai:
             api_key = os.environ.get("OPENAI_API_KEY") or None
         self._api_key = api_key.strip() if api_key and api_key.strip() else None
+        if is_openai and self._api_key is None:
+            raise ValueError("api_key is required for api.openai.com (or set OPENAI_API_KEY)")
 
         self.dimension = _positive_int_or_none(dimension, "dimension")
         if request_dimensions and self.dimension is None:
@@ -195,6 +203,9 @@ class OpenAICompatibleEmbeddingBackend:
         return self._parse(body, len(texts))
 
     def _post_with_retry(self, payload: dict[str, Any]) -> Any:
+        # Re-checked per request: HEADROOM_OFFLINE can be switched on after this
+        # backend (and its pooled client) was built and cached.
+        guard_egress(_PURPOSE, self.host)
         client = self._get_client()
         attempt = 0
         while True:
@@ -202,7 +213,7 @@ class OpenAICompatibleEmbeddingBackend:
                 response = client.post("/embeddings", json=payload)
             except httpx.TransportError as exc:
                 if attempt >= self.max_retries:
-                    raise ConnectionError(
+                    raise EmbeddingBackendRequestError(
                         f"Embedding request to {self.host} failed after {attempt + 1} attempt(s): "
                         f"{type(exc).__name__}"
                     ) from exc
@@ -222,7 +233,7 @@ class OpenAICompatibleEmbeddingBackend:
                 self._sleep_before_retry(attempt, response.headers.get("retry-after"))
                 attempt += 1
                 continue
-            raise ConnectionError(
+            raise EmbeddingBackendRequestError(
                 f"Embedding API at {self.host} returned HTTP {response.status_code}"
                 f"{_error_detail(response, self._api_key)}"
             )
@@ -281,7 +292,13 @@ class OpenAICompatibleEmbeddingBackend:
 
 
 def _error_detail(response: httpx.Response, api_key: str | None) -> str:
-    """A short description of an error body: the API's own message, key redacted."""
+    """The API's own error message, key redacted, when content logging is on.
+
+    Off by default: servers can echo request input in their errors, and the
+    input is prompt or tool content.
+    """
+    if not content_logging_enabled():
+        return ""
     try:
         body = response.json()
     except ValueError:
