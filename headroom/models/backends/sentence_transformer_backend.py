@@ -3,15 +3,30 @@
 Loads the model through :class:`headroom.models.ml_models.MLModelRegistry`, so
 it shares the process-wide instance other components use, is cache-first, and
 refuses legibly under ``HEADROOM_OFFLINE`` when the weights are not cached.
-Needs the ``sentence-transformers`` package (and torch).
+Needs the ``sentence-transformers`` package (and torch), from the ``memory``
+extra; construction checks it is installed without importing it.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 import threading
 from typing import Any
 
-from .embedding import _positive_int_or_none
+from .embedding import EmbeddingBackendResponseError, _positive_int_or_none
+
+_PACKAGE = "sentence_transformers"
+
+
+def _package_installed() -> bool:
+    """Whether ``sentence_transformers`` can be imported, without importing it."""
+    if _PACKAGE in sys.modules:
+        return sys.modules[_PACKAGE] is not None
+    try:
+        return importlib.util.find_spec(_PACKAGE) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 class SentenceTransformerBackend:
@@ -23,6 +38,10 @@ class SentenceTransformerBackend:
         dimension: Expected output width. Learnt from the model when omitted.
         device: ``cpu``, ``cuda`` or ``mps``. Auto-detected when omitted.
         batch_size: Batch size passed to ``encode``.
+
+    Raises:
+        RuntimeError: sentence-transformers is not installed.
+        ValueError: ``dimension`` or ``batch_size`` is not a positive integer.
     """
 
     name = "sentence-transformers"
@@ -35,6 +54,11 @@ class SentenceTransformerBackend:
         device: str | None = None,
         batch_size: int = 32,
     ) -> None:
+        if not _package_installed():
+            raise RuntimeError(
+                "The sentence-transformers embedding backend requires sentence-transformers "
+                'and PyTorch. Install with: pip install "headroom-ai[memory]"'
+            )
         from headroom.models.config import ML_MODEL_DEFAULTS
 
         self.model_name = (model or "").strip() or ML_MODEL_DEFAULTS.sentence_transformer
@@ -55,9 +79,11 @@ class SentenceTransformerBackend:
                     native = getattr(model, "get_sentence_embedding_dimension", None)
                     width = native() if callable(native) else None
                     if self.dimension is not None and width and width != self.dimension:
-                        raise ValueError(
-                            f"sentence-transformers model {self.model_name!r} produces "
-                            f"{width}-dimensional vectors, not {self.dimension}"
+                        # A BackendError, so embed_texts keeps this message
+                        # instead of reducing it to the exception class.
+                        raise EmbeddingBackendResponseError(
+                            f"The sentence-transformers model produces {width}-dimensional "
+                            f"vectors, not the {self.dimension} configured"
                         )
                     if self.dimension is None and isinstance(width, int) and width > 0:
                         self.dimension = width

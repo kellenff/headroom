@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -12,6 +14,7 @@ import pytest
 
 from headroom.models.backends import (
     EMBEDDING_BACKENDS,
+    BackendError,
     BackendLoadError,
     BackendRegistry,
     CallableEmbeddingBackend,
@@ -256,6 +259,98 @@ class TestBackendRegistry:
             reg.create("dup")
         assert first.loads == 0 and second.loads == 0
 
+    def test_third_party_factory_backend_error_is_reduced_to_its_class(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class PluginError(BackendError):
+            pass
+
+        def factory(**kw: Any) -> Any:
+            raise PluginError("could not reach https://u:CANARY-SECRET@host/")
+
+        reg: BackendRegistry[Any] = BackendRegistry("thing", "test.group")
+        reg.register("remote", factory)
+        with caplog.at_level("DEBUG"), pytest.raises(BackendLoadError) as excinfo:
+            reg.create("remote")
+        assert type(excinfo.value) is BackendLoadError
+        assert "CANARY-SECRET" not in str(excinfo.value)
+        assert "PluginError" in str(excinfo.value) and "remote" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, PluginError)
+        assert all("CANARY-SECRET" not in r.getMessage() for r in caplog.records)
+
+    def test_builtin_factory_backend_error_passes_through(self) -> None:
+        hint = BackendLoadError("model unavailable; pre-seed the cache")
+
+        def factory(**kw: Any) -> Any:
+            raise hint
+
+        reg: BackendRegistry[Any] = BackendRegistry("thing", "test.group")
+        reg.register_builtin("core", factory)
+        with pytest.raises(BackendLoadError) as excinfo:
+            reg.create("core")
+        assert excinfo.value is hint
+        # The same factory registered as a third-party override is not trusted.
+        reg.register("core", factory, replace=True)
+        with pytest.raises(BackendLoadError) as excinfo:
+            reg.create("core")
+        assert excinfo.value is not hint and "pre-seed" not in str(excinfo.value)
+
+    def test_registration_racing_an_entry_point_load_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reg: BackendRegistry[Any] = BackendRegistry("thing", "test.group")
+
+        def registered(**kw: Any) -> str:
+            return "registered"
+
+        class RacingEntryPoint(_FakeEntryPoint):
+            def load(self) -> Any:
+                # Another thread registers the name while the plugin imports.
+                reg.register("x", registered)
+                return super().load()
+
+        _patch_entry_points(monkeypatch, [RacingEntryPoint("x", lambda **kw: "entry-point")])
+        assert reg.get_factory("x") is registered
+        assert reg.get_factory("x") is registered
+        assert reg.create("x") == "registered"
+
+    def test_builtin_registered_during_an_entry_point_load_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reg: BackendRegistry[Any] = BackendRegistry("thing", "test.group")
+
+        class RacingEntryPoint(_FakeEntryPoint):
+            def load(self) -> Any:
+                reg.register_builtin("x", lambda **kw: "builtin")
+                return super().load()
+
+        _patch_entry_points(monkeypatch, [RacingEntryPoint("x", lambda **kw: "entry-point")])
+        assert reg.create("x") == "builtin"
+        assert reg.create("x") == "builtin"
+
+    def test_is_builtin_instance(self) -> None:
+        from collections import OrderedDict
+
+        class Core:
+            pass
+
+        class Sub(Core):
+            pass
+
+        reg: BackendRegistry[Any] = BackendRegistry("thing", "test.group")
+        reg.register_builtin("core", Core)
+        reg.register_builtin("lazy", "collections:OrderedDict")
+        reg.register_builtin("ghost", "headroom_no_such_module:Thing")
+        reg.register("alias", Core)
+
+        assert reg.is_builtin_instance(Core())
+        assert not reg.is_builtin_instance(Sub())
+        assert not reg.is_builtin_instance(object())
+        assert reg.is_builtin_instance(OrderedDict())
+        # A lazy built-in whose module was never imported is not imported to check.
+        assert not reg.is_builtin_instance(42)
+        assert "headroom_no_such_module" not in sys.modules
+
     def test_offline_refusal_is_not_wrapped(self) -> None:
         def factory(**kw: Any) -> Any:
             raise OfflineEgressBlocked("test backend", "example.com")
@@ -438,6 +533,37 @@ class TestEmbedTexts:
         assert isinstance(excinfo.value.__cause__, RuntimeError)
         assert all("CONTENT-CANARY" not in r.getMessage() for r in caplog.records)
 
+    def test_third_party_backend_errors_are_reduced_even_when_backend_errors(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+
+        class PluginError(BackendError):
+            pass
+
+        class Plugin(_Backend):
+            name = "plugin"
+
+            def embed(self, texts: list[str]) -> Any:
+                raise PluginError("POST https://u:sk-CANARY@emb.example/v1 failed")
+
+        def callable_fn(texts: list[str]) -> Any:
+            raise EmbeddingBackendResponseError("bad rows for CONTENT-CANARY")
+
+        class OpenAISubclass(OpenAICompatibleEmbeddingBackend):
+            def embed(self, texts: list[str]) -> list[list[float]]:
+                raise PluginError("subclass of a built-in sk-CANARY")
+
+        subclass = OpenAISubclass("m", base_url="http://127.0.0.1:9/v1")
+        for backend in (Plugin(), CallableEmbeddingBackend(callable_fn, name="plugin"), subclass):
+            with caplog.at_level("DEBUG"), pytest.raises(EmbeddingBackendCallError) as excinfo:
+                embed_texts(backend, ["hello"])
+            message = str(excinfo.value)
+            assert "CANARY" not in message
+            assert "failed (" in message
+            assert isinstance(excinfo.value.__cause__, BackendError)
+        assert all("CANARY" not in r.getMessage() for r in caplog.records)
+
     def test_untrusted_backend_names_are_not_echoed(self) -> None:
         backend = CallableEmbeddingBackend(lambda t: [[1.0]], name="Evil\nname", dimension=2)
         with pytest.raises(EmbeddingBackendResponseError) as excinfo:
@@ -617,6 +743,96 @@ class TestMemoryAndRelevanceEnv:
         with pytest.raises(ValueError, match="HEADROOM_EMBEDDER_PROVIDER"):
             relevance_embedder_settings_from_env({"HEADROOM_RELEVANCE_EMBEDDER_PROVIDER": "memory"})
 
+    @pytest.mark.parametrize(
+        ("env", "var"),
+        [
+            (
+                {"HEADROOM_EMBEDDER_PROVIDER": "openai", "HEADROOM_EMBEDDER_DIMENSION": "1536"},
+                "HEADROOM_EMBEDDER_API_KEY",
+            ),
+            (
+                {"HEADROOM_EMBEDDER_RUNTIME": "openai", "HEADROOM_EMBEDDER_DIMENSION": "1536"},
+                "HEADROOM_EMBEDDER_API_KEY",
+            ),
+            (
+                {
+                    "HEADROOM_EMBEDDER_PROVIDER": "openai",
+                    "HEADROOM_EMBEDDER_BASE_URL": "https://API.openai.com/v1/",
+                    "HEADROOM_EMBEDDER_API_KEY": "  ",
+                },
+                "HEADROOM_EMBEDDER_API_KEY",
+            ),
+            (
+                {
+                    "HEADROOM_EMBEDDER_PROVIDER": "openai",
+                    "HEADROOM_EMBEDDER_OPTIONS": '{"api_key": null}',
+                },
+                "HEADROOM_EMBEDDER_API_KEY",
+            ),
+            (
+                {"HEADROOM_RELEVANCE_EMBEDDER_PROVIDER": "openai"},
+                "HEADROOM_RELEVANCE_EMBEDDER_API_KEY",
+            ),
+            (
+                {
+                    "HEADROOM_RELEVANCE_EMBEDDER_PROVIDER": "memory",
+                    "HEADROOM_EMBEDDER_PROVIDER": "openai",
+                },
+                "HEADROOM_EMBEDDER_API_KEY",
+            ),
+        ],
+    )
+    def test_env_selected_openai_never_uses_the_chat_key(
+        self, env: dict[str, str], var: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-proxy-chat-credential")
+        read = (
+            relevance_embedder_settings_from_env
+            if "HEADROOM_RELEVANCE_EMBEDDER_PROVIDER" in env
+            else memory_embedder_settings_from_env
+        )
+        with pytest.raises(ValueError, match=var) as excinfo:
+            read(env)
+        assert "sk-proxy-chat-credential" not in str(excinfo.value)
+
+    def test_env_selected_openai_with_its_own_key_or_another_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-proxy-chat-credential")
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        own = memory_embedder_settings_from_env(
+            {"HEADROOM_EMBEDDER_PROVIDER": "openai", "HEADROOM_EMBEDDER_API_KEY": "sk-embed"}
+        )
+        assert own is not None
+        assert own.create()._api_key == "sk-embed"  # type: ignore[attr-defined]
+        via_options = relevance_embedder_settings_from_env(
+            {
+                "HEADROOM_RELEVANCE_EMBEDDER_PROVIDER": "openai",
+                "HEADROOM_RELEVANCE_EMBEDDER_OPTIONS": '{"api_key": "sk-embed"}',
+            }
+        )
+        assert via_options is not None
+        local = memory_embedder_settings_from_env(
+            {
+                "HEADROOM_EMBEDDER_PROVIDER": "openai",
+                "HEADROOM_EMBEDDER_MODEL": "m",
+                "HEADROOM_EMBEDDER_BASE_URL": "http://127.0.0.1:9/v1",
+            }
+        )
+        assert local is not None
+        assert local.create()._api_key is None  # type: ignore[attr-defined]
+
+    def test_contradictions_are_reported_before_a_missing_key(self) -> None:
+        with pytest.raises(ValueError, match="HEADROOM_EMBEDDER_RUNTIME"):
+            memory_embedder_settings_from_env(
+                {"HEADROOM_EMBEDDER_RUNTIME": "pytorch_mps", "HEADROOM_EMBEDDER_PROVIDER": "openai"}
+            )
+
+    def test_a_replaced_openai_backend_needs_no_key(self) -> None:
+        register_embedding_backend("openai", _Backend, replace=True)
+        settings = memory_embedder_settings_from_env({"HEADROOM_EMBEDDER_PROVIDER": "openai"})
+        assert settings is not None and isinstance(settings.create(), _Backend)
+
     def test_relevance_memory_rejects_stray_companions(self) -> None:
         with pytest.raises(ValueError, match="HEADROOM_RELEVANCE_EMBEDDER_MODEL"):
             relevance_embedder_settings_from_env(
@@ -649,6 +865,8 @@ def embedding_server(monkeypatch: pytest.MonkeyPatch):
                 {
                     "path": self.path,
                     "authorization": self.headers.get("Authorization"),
+                    "authorization_all": self.headers.get_all("Authorization"),
+                    "content_type_all": self.headers.get_all("Content-Type"),
                     "x_team": self.headers.get("X-Team"),
                     "body": body,
                 }
@@ -717,6 +935,18 @@ class TestOpenAICompatibleBackend:
             "input": ["a", "abc"],
             "encoding_format": "float",
         }
+
+    def test_custom_headers_replace_defaults_case_insensitively(self, embedding_server) -> None:
+        url, seen, _ = embedding_server
+        backend = OpenAICompatibleEmbeddingBackend(
+            "m",
+            base_url=url,
+            api_key="KEY1",
+            headers={"authorization": "Basic OTHER", "content-type": "application/json"},
+        )
+        backend.embed(["x"])
+        assert seen[0]["authorization_all"] == ["Basic OTHER"]
+        assert seen[0]["content_type_all"] == ["application/json"]
 
     def test_no_key_means_no_auth_header(self, embedding_server) -> None:
         url, seen, _ = embedding_server
@@ -891,6 +1121,69 @@ class TestOpenAICompatibleBackend:
         with pytest.raises(ValueError, match="base_url"):
             OpenAICompatibleEmbeddingBackend("m", base_url=base_url)
 
+    @pytest.mark.parametrize(
+        "base_url",
+        ["http://127.0.0.1:80a0/v1", "http://127.0.0.1:99999/v1", "http://127.0.0.1:-1/v1"],
+    )
+    def test_rejects_a_bad_port_at_construction(
+        self, base_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        with pytest.raises(ValueError, match="base_url") as excinfo:
+            OpenAICompatibleEmbeddingBackend("m", base_url=base_url)
+        assert base_url not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "option", "secret"),
+        [
+            ({"headers": {"X Api Key": "abc"}}, "headers", "X Api Key"),
+            ({"headers": {"X:Y": "abc"}}, "headers", "X:Y"),
+            ({"headers": {"": "abc"}}, "headers", None),
+            ({"headers": {"X-Api-Key": "cl\u00e9-CANARY"}}, "headers", "CANARY"),
+            ({"headers": {"X-Api-Key": " CANARY"}}, "headers", "CANARY"),
+            ({"headers": {"X-Api-Key": "CANARY\t"}}, "headers", "CANARY"),
+            ({"headers": {"X-Api-Key": "a\x01CANARY"}}, "headers", "CANARY"),
+            ({"headers": {"X-A": "1", "x-a": "2"}}, "headers", None),
+            ({"api_key": "sk-cl\u00e9-CANARY"}, "api_key", "CANARY"),
+            ({"api_key": "sk-\x01CANARY"}, "api_key", "CANARY"),
+        ],
+    )
+    def test_rejects_what_httpx_would_refuse_at_construction(
+        self,
+        kwargs: dict[str, Any],
+        option: str,
+        secret: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        with pytest.raises(ValueError, match=option) as excinfo:
+            OpenAICompatibleEmbeddingBackend("m", base_url="http://127.0.0.1:9/v1", **kwargs)
+        if secret is not None:
+            assert secret not in str(excinfo.value)
+
+    def test_valid_headers_still_work(self, embedding_server) -> None:
+        url, seen, _ = embedding_server
+        backend = OpenAICompatibleEmbeddingBackend(
+            "m", base_url=url, headers={"X-Team": "search team", "X-Empty": ""}
+        )
+        backend.embed(["x"])
+        assert seen[0]["x_team"] == "search team"
+
+    def test_bad_env_headers_fail_the_startup_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        settings = memory_embedder_settings_from_env(
+            {
+                "HEADROOM_EMBEDDER_PROVIDER": "openai",
+                "HEADROOM_EMBEDDER_MODEL": "m",
+                "HEADROOM_EMBEDDER_BASE_URL": "http://127.0.0.1:9/v1",
+                "HEADROOM_EMBEDDER_HEADERS": "X-Api-Key=cl\u00e9-CANARY",
+            }
+        )
+        assert settings is not None
+        with pytest.raises(BackendLoadError, match="headers") as excinfo:
+            settings.create()
+        assert "CANARY" not in str(excinfo.value)
+
     def test_model_required_off_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
         with pytest.raises(ValueError, match="model is required"):
@@ -970,6 +1263,36 @@ class TestSentenceTransformerBackend:
             "headroom.models.ml_models.MLModelRegistry.get_sentence_transformer",
             lambda *a, **k: FakeModel(),
         )
-        backend = create_embedding_backend("sentence-transformers", dimension=768)
+        backend = create_embedding_backend("sentence-transformers:secret-path", dimension=768)
         with pytest.raises(ValueError, match="384"):
             backend.embed(["x"])
+        # Through embed_texts the built-in's explanation survives, not just a class.
+        with pytest.raises(EmbeddingBackendResponseError, match="384-dimensional") as excinfo:
+            embed_texts(backend, ["x"])
+        assert "768" in str(excinfo.value)
+        assert "secret-path" not in str(excinfo.value)
+
+    def test_missing_package_fails_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+        with pytest.raises(BackendLoadError, match=r"headroom-ai\[memory\]"):
+            create_embedding_backend("sentence-transformers")
+        settings = memory_embedder_settings_from_env(
+            {"HEADROOM_EMBEDDER_PROVIDER": "sentence-transformers"}
+        )
+        assert settings is not None
+        with pytest.raises(BackendLoadError, match="requires sentence-transformers"):
+            settings.create()
+
+    def test_package_check_does_not_import_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from headroom.models.backends import sentence_transformer_backend as st
+
+        monkeypatch.delitem(sys.modules, "sentence_transformers", raising=False)
+        monkeypatch.setattr(st.importlib.util, "find_spec", lambda name: object())
+        st.SentenceTransformerBackend()
+        assert "sentence_transformers" not in sys.modules
+        monkeypatch.setattr(st.importlib.util, "find_spec", lambda name: None)
+        with pytest.raises(RuntimeError, match="requires sentence-transformers"):
+            st.SentenceTransformerBackend()
+        # A stub module put in place by a test counts as installed.
+        monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace())
+        st.SentenceTransformerBackend()
