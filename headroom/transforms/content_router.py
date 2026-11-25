@@ -2508,6 +2508,9 @@ class ContentRouterConfig:
     # than this many records, capping embedding work on the request thread.
     # 0 = no cap (default): every record is scored regardless of size. Set a
     # positive value to bound per-request embedding cost on very large outputs.
+    # While a configured relevance.embedding_backend scores the split, 0 means
+    # relevance.backend_config.RELEVANCE_BACKEND_MAX_RECORDS (512) instead, so
+    # a remote backend is never sent an unbounded output.
     relevance_max_records: int = 0
     # Adaptive KEEP/DROP cut: when True (default), the threshold is the natural
     # relevant/irrelevant break in each output's score distribution (Otsu),
@@ -2827,6 +2830,9 @@ class ContentRouter(Transform):
         self._relevance_scorer: Any = None
         self._relevance_scorer_tried: bool = False
         self._relevance_prewarm_started: bool = False
+        # Set (before the swap) once a configured embedding backend scores the
+        # split; it turns on the backend record cap (_relevance_max_records).
+        self._relevance_uses_backend: bool = False
         # STAGE 0 memo: `(hash(content), len(content), strategy) -> (best, label)`.
         # `_lossless_first` is a pure function of its arguments but is called
         # twice for the same block (`_has_lossless_fold` probes it, then STAGE 0
@@ -5599,25 +5605,112 @@ class ContentRouter(Transform):
         """Warm the embedding model off the request thread, then swap it in.
 
         Idempotent. On failure (fastembed missing, download error) the router
-        just stays on the BM25 scorer set by ``_get_relevance_scorer``.
+        just stays on the BM25 scorer set by ``_get_relevance_scorer``. The
+        work is :meth:`_prewarm_relevance_scorer`.
         """
         if getattr(self, "_relevance_prewarm_started", False):
             return
         self._relevance_prewarm_started = True
+        threading.Thread(
+            target=self._prewarm_relevance_scorer,
+            args=(tier,),
+            name="relevance-prewarm",
+            daemon=True,
+        ).start()
 
-        def _warm() -> None:
-            try:
-                from ..relevance import create_scorer
+    def _prewarm_relevance_scorer(self, tier: str) -> None:
+        """Build the embedding-backed scorer, warm it, swap it in. Never raises.
 
+        Without ``config.relevance.embedding_backend`` (the default) this is the
+        fastembed path as it always was: any failure leaves the router on BM25,
+        logged at DEBUG, since fastembed is an optional extra.
+
+        With one, the backend is resolved here, off the request thread; for
+        ``"env"`` that is when the HEADROOM_RELEVANCE_EMBEDDER_* variables are
+        read, and nothing selected there means the fastembed path above.
+        Then:
+
+        * The backend cannot be built (unknown name, bad option, missing
+          package): WARNING, and BM25 for the life of the router. A
+          configuration error does not fix itself.
+        * The warm-up embed fails: the scorer is swapped in anyway. Its circuit
+          breaker has reported the failure and retries the backend after a
+          cooldown, and the hybrid tier scores with BM25 meanwhile, so a
+          backend that comes up after the proxy is not locked out.
+
+        ``HEADROOM_OFFLINE`` refusing the backend is reported through
+        ``note_refusal`` and leaves BM25 in place. It is caught by name because
+        it is a BaseException; an uncaught one would reach
+        ``threading.excepthook`` as a bare traceback.
+        """
+        from ..log_safety import describe_class, describe_exception
+        from ..offline import note_refusal
+
+        spec = self.config.relevance.embedding_backend
+        # Whether a failure is the operator's explicit choice failing: from a
+        # configured spec until it turns out to select nothing ("env", unset).
+        explicit = spec is not None
+        try:
+            from ..relevance import create_scorer
+
+            backend = None
+            if spec is not None:
+                from ..relevance.backend_config import resolve_relevance_embedding_backend
+
+                backend = resolve_relevance_embedding_backend(spec)
+                explicit = backend is not None
+
+            if backend is None:
                 scorer = create_scorer(tier)
                 # Force the model download+load and a first embed here, in the
-                # background — so the first real request finds it warm.
-                scorer.score_batch(["warmup"], "warmup")
-                self._relevance_scorer = scorer  # GIL-atomic ref swap
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("relevance model prewarm failed; staying on BM25: %s", exc)
+                # background — so the first real request finds it warm. The
+                # embedding half is warmed itself: the hybrid scorer would fall
+                # back to BM25 on its failure, and swap in a scorer whose model
+                # never loads.
+                warm = getattr(scorer, "embedding", None) or scorer
+                warm.score_batch(["warmup"], "warmup")
+            else:
+                from ..models.backends.embedding import _backend_label
 
-        threading.Thread(target=_warm, name="relevance-prewarm", daemon=True).start()
+                scorer = create_scorer(tier, embedding_backend=backend)
+                warm = getattr(scorer, "embedding", None) or scorer
+                try:
+                    warm.score_batch(["warmup"], "warmup")
+                except Exception:  # noqa: BLE001 - the scorer's breaker reported it
+                    pass
+                # Set before the swap: the split reads it for its record cap.
+                self._relevance_uses_backend = True
+                logger.info("Relevance scoring uses embedding backend %r", _backend_label(backend))
+            self._relevance_scorer = scorer  # GIL-atomic ref swap
+        except OfflineEgressBlocked as blocked:
+            note_refusal(blocked, logger)
+        except Exception as exc:  # noqa: BLE001
+            if not explicit:
+                logger.debug("relevance model prewarm failed; staying on BM25: %s", exc)
+                return
+            from ..relevance.backend_config import describe_relevance_embedding_backend
+
+            # Class only: a plugin's message can quote its endpoint or key.
+            logger.warning(
+                "Relevance embedding backend %s could not be started (%s); relevance scoring "
+                "stays on BM25. Details are logged at DEBUG.",
+                describe_relevance_embedding_backend(spec),
+                describe_class(type(exc)),
+            )
+            logger.debug("relevance embedding backend failed: %s", describe_exception(exc))
+
+    def _relevance_max_records(self) -> int:
+        """The split's record cap: ``relevance_max_records``, bounded while a backend scores.
+
+        0 means no cap, except while a configured embedding backend is in use,
+        where it means :data:`~headroom.relevance.backend_config.RELEVANCE_BACKEND_MAX_RECORDS`.
+        """
+        configured = self.config.relevance_max_records
+        if configured or not getattr(self, "_relevance_uses_backend", False):
+            return configured
+        from ..relevance.backend_config import RELEVANCE_BACKEND_MAX_RECORDS
+
+        return RELEVANCE_BACKEND_MAX_RECORDS
 
     def _relevance_split_compress(self, content: str, kind: str, query: str) -> str | None:
         """Prompt-conditioned KEEP/DROP split for the compression tail.
@@ -5638,7 +5731,9 @@ class ContentRouter(Transform):
         Embedding cost is bounded two ways: the model is pre-warmed off the
         request thread (BM25 until it's ready, see _get_relevance_scorer) and
         outputs segmenting into more than ``relevance_max_records`` records skip
-        the split entirely.
+        the split entirely. With a configured embedding backend that cap is
+        never unbounded (see _relevance_max_records), and a failing backend
+        costs at most one call per cooldown (EmbeddingScorer's breaker).
         """
         scorer = self._get_relevance_scorer()
         if scorer is None or not query.strip():
@@ -5654,7 +5749,7 @@ class ContentRouter(Transform):
                 scorer,
                 threshold=self.config.relevance.relevance_threshold,
                 adaptive=self.config.relevance_adaptive_threshold,
-                max_records=self.config.relevance_max_records,
+                max_records=self._relevance_max_records(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("relevance split failed (%s); falling back", exc)

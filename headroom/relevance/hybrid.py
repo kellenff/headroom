@@ -7,7 +7,8 @@ automatically adjust the balance based on query characteristics.
 Key features:
 - Best of both worlds: exact ID matching + semantic understanding
 - Adaptive alpha: increases BM25 weight for UUID/ID-heavy queries
-- Graceful degradation: falls back to BM25 if embeddings unavailable
+- Graceful degradation: falls back to BM25 if embeddings are unavailable,
+  or for any call in which the embedding half fails
 - Research-backed: Dynamic Alpha Tuning gives +2-7.5% gains (Hsu et al., 2025)
 
 Recommended for production use where accuracy matters.
@@ -15,11 +16,17 @@ Recommended for production use where accuracy matters.
 
 from __future__ import annotations
 
+import logging
 import re
+import threading
+
+from headroom.log_safety import describe_class, describe_exception
 
 from .base import RelevanceScore, RelevanceScorer
 from .bm25 import BM25Scorer
 from .embedding import EmbeddingScorer
+
+logger = logging.getLogger(__name__)
 
 
 class HybridScorer(RelevanceScorer):
@@ -46,7 +53,10 @@ class HybridScorer(RelevanceScorer):
         # Semantic query: alpha ~0.5 (balanced)
         score2 = scorer.score(item, "show me the failed requests")
 
-    If sentence-transformers is not installed, falls back to pure BM25.
+    If fastembed is not installed, falls back to pure BM25. If the embedding
+    scorer raises during a call (a remote backend timing out, a circuit
+    breaker refusing), that call is scored with BM25 alone, exactly as it would
+    be without embeddings; the first such failure is logged at WARNING.
     """
 
     # Patterns that indicate exact match is important
@@ -64,7 +74,7 @@ class HybridScorer(RelevanceScorer):
         alpha: float = 0.5,
         adaptive: bool = True,
         bm25_scorer: BM25Scorer | None = None,
-        embedding_scorer: EmbeddingScorer | None = None,
+        embedding_scorer: RelevanceScorer | None = None,
     ):
         """Initialize hybrid scorer.
 
@@ -73,7 +83,9 @@ class HybridScorer(RelevanceScorer):
                 Combined score = alpha * BM25 + (1 - alpha) * Embedding.
             adaptive: If True, adjust alpha per query based on patterns.
             bm25_scorer: Custom BM25 scorer instance (uses default if None).
-            embedding_scorer: Custom embedding scorer (uses default if None).
+            embedding_scorer: Custom embedding scorer (uses default if None),
+                e.g. ``EmbeddingScorer(backend=...)`` or any scorer whose
+                scores are semantic similarities in [0, 1].
         """
         self.base_alpha = alpha
         self.adaptive = adaptive
@@ -81,8 +93,11 @@ class HybridScorer(RelevanceScorer):
         # Initialize scorers
         self.bm25 = bm25_scorer or BM25Scorer()
 
+        self._failure_warned = False
+        self._failure_lock = threading.Lock()
+
         # Embedding scorer with graceful fallback
-        self.embedding: EmbeddingScorer | None = None
+        self.embedding: RelevanceScorer | None = None
         if embedding_scorer is not None:
             self.embedding = embedding_scorer
             self._embedding_available = True
@@ -108,7 +123,9 @@ class HybridScorer(RelevanceScorer):
         """Check if embedding scoring is available.
 
         Returns:
-            True if sentence-transformers is installed.
+            True if an embedding scorer was given or fastembed is installed.
+            A True result does not promise every call succeeds; see
+            :meth:`score_batch`.
         """
         return self._embedding_available
 
@@ -150,6 +167,47 @@ class HybridScorer(RelevanceScorer):
         # Clamp to valid range
         return max(0.3, min(0.9, alpha))
 
+    @staticmethod
+    def _boosted(result: RelevanceScore) -> RelevanceScore:
+        """The BM25-only score: what every call returns when embeddings are not used.
+
+        BM25 scores are inherently low on single-term matches, so a match is
+        lifted to at least 0.3 (plus 0.2 for two or more matched terms) to
+        stay above typical thresholds without semantic understanding.
+        """
+        boosted_score = result.score
+        if result.matched_terms:
+            # Ensure matched items get at least 0.3 score
+            boosted_score = max(boosted_score, 0.3)
+            # Additional boost for multiple matches
+            if len(result.matched_terms) >= 2:
+                boosted_score = min(1.0, boosted_score + 0.2)
+        return RelevanceScore(
+            score=boosted_score,
+            reason=f"Hybrid (BM25 only, boosted): {result.reason}",
+            matched_terms=result.matched_terms,
+        )
+
+    def _embedding_failed(self, exc: Exception) -> None:
+        """Report a failed embedding call: WARNING the first time, DEBUG after.
+
+        Only the exception's class is named at WARNING: an embedding backend's
+        message can quote its endpoint, key or the scored content.
+        """
+        with self._failure_lock:
+            first, self._failure_warned = not self._failure_warned, True
+        if first:
+            logger.warning(
+                "Relevance embedding scoring failed (%s); calls it fails in are scored with "
+                "BM25 only. Logged once per scorer; later failures are logged at DEBUG.",
+                describe_class(type(exc)),
+            )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Embedding half of hybrid scoring failed; using BM25 only: %s",
+                describe_exception(exc),
+            )
+
     def score(self, item: str, context: str) -> RelevanceScore:
         """Score item using hybrid BM25 + embedding fusion.
 
@@ -158,31 +216,22 @@ class HybridScorer(RelevanceScorer):
             context: Query context.
 
         Returns:
-            RelevanceScore with combined score.
+            RelevanceScore with combined score, or the BM25-only score when
+            embeddings are unavailable or fail for this call.
         """
         # Get BM25 score
         bm25_result = self.bm25.score(item, context)
 
-        # If embeddings unavailable, boost BM25 scores since they're inherently lower
-        # This ensures reasonable matching even without semantic understanding
         if not self._embedding_available or self.embedding is None:
-            # Boost BM25 score: if there's ANY match, ensure it's above typical threshold
-            # This compensates for BM25's low scores on single-term matches
-            boosted_score = bm25_result.score
-            if bm25_result.matched_terms:
-                # Ensure matched items get at least 0.3 score
-                boosted_score = max(boosted_score, 0.3)
-                # Additional boost for multiple matches
-                if len(bm25_result.matched_terms) >= 2:
-                    boosted_score = min(1.0, boosted_score + 0.2)
-            return RelevanceScore(
-                score=boosted_score,
-                reason=f"Hybrid (BM25 only, boosted): {bm25_result.reason}",
-                matched_terms=bm25_result.matched_terms,
-            )
+            return self._boosted(bm25_result)
 
-        # Get embedding score
-        emb_result = self.embedding.score(item, context)
+        # Get embedding score. Exception only: OfflineEgressBlocked is a
+        # BaseException on purpose and must reach the caller, not degrade here.
+        try:
+            emb_result = self.embedding.score(item, context)
+        except Exception as exc:
+            self._embedding_failed(exc)
+            return self._boosted(bm25_result)
 
         # Compute adaptive alpha
         alpha = self._compute_alpha(context)
@@ -210,7 +259,8 @@ class HybridScorer(RelevanceScorer):
             context: Query context.
 
         Returns:
-            List of RelevanceScore objects.
+            List of RelevanceScore objects; BM25-only scores when embeddings
+            are unavailable or fail for this call.
         """
         if not items:
             return []
@@ -218,28 +268,15 @@ class HybridScorer(RelevanceScorer):
         # Get BM25 scores
         bm25_results = self.bm25.score_batch(items, context)
 
-        # If embeddings unavailable, boost BM25 scores and return
         if not self._embedding_available or self.embedding is None:
-            boosted_results = []
-            for r in bm25_results:
-                boosted_score = r.score
-                if r.matched_terms:
-                    # Ensure matched items get at least 0.3 score
-                    boosted_score = max(boosted_score, 0.3)
-                    # Additional boost for multiple matches
-                    if len(r.matched_terms) >= 2:
-                        boosted_score = min(1.0, boosted_score + 0.2)
-                boosted_results.append(
-                    RelevanceScore(
-                        score=boosted_score,
-                        reason=f"Hybrid (BM25 only, boosted): {r.reason}",
-                        matched_terms=r.matched_terms,
-                    )
-                )
-            return boosted_results
+            return [self._boosted(r) for r in bm25_results]
 
-        # Get embedding scores
-        emb_results = self.embedding.score_batch(items, context)
+        # Get embedding scores (Exception only, as in score()).
+        try:
+            emb_results = self.embedding.score_batch(items, context)
+        except Exception as exc:
+            self._embedding_failed(exc)
+            return [self._boosted(r) for r in bm25_results]
 
         # Compute adaptive alpha (same for all items in batch)
         alpha = self._compute_alpha(context)

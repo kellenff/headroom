@@ -18,6 +18,13 @@ Key features:
 
 Install with: pip install "headroom-ai[relevance]"
 
+Pluggable backends: ``EmbeddingScorer(backend=...)`` scores with any
+:class:`~headroom.models.backends.EmbeddingBackend` instead (an
+OpenAI-compatible server, a plugin, a plain function). This module also holds
+the built-in ``fastembed`` backend, :class:`FastEmbedBackend`, which loads the
+same model through the same loaders as the scorer: keeping both here keeps the
+fastembed construction sites to the two the air-gap allowlist accounts for.
+
 History: this module previously wrapped `sentence-transformers`
 (PyTorch). Switched to fastembed in Stage 3c.1 of the Rust port to:
 1. Run the same ONNX model as the Rust embedding scorer (both call
@@ -30,13 +37,26 @@ History: this module previously wrapped `sentence-transformers`
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from headroom.log_safety import describe_class, describe_exception
+from headroom.models.backends import (
+    BackendError,
+    BackendLoadError,
+    EmbeddingBackend,
+    EmbeddingBackendResponseError,
+    as_embedding_backend,
+    embed_texts,
+)
+from headroom.models.backends.embedding import _backend_label, _positive_int_or_none
 from headroom.offline import OfflineEgressBlocked, guard_egress
 from headroom.onnx_runtime import _resolve_revision, hf_hub_download_local_first
 
@@ -239,6 +259,134 @@ def _load_default_model() -> TextEmbedding:
         return TextEmbedding(model_name=DEFAULT_MODEL_NAME, specific_model_path=snapshot)
 
 
+def _load_fastembed_model(model_name: str) -> TextEmbedding:
+    """Load ``model_name`` with the loader that owns it.
+
+    The single dispatch both the scorer and :class:`FastEmbedBackend` go
+    through, so neither grows a fastembed construction site of its own (the
+    air-gap allowlist counts the two above).
+
+    Raises:
+        OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and the weights are
+            not cached.
+    """
+    if model_name == DEFAULT_MODEL_NAME:
+        return _load_default_model()
+    # Other catalog models are not pinned: fastembed resolves them on the
+    # repo's main, cache first.
+    return _load_text_embedding({"model_name": model_name})
+
+
+def _model_unavailable_message(model_name: str, blocked: OfflineEgressBlocked) -> str:
+    """What to tell a caller whose model the air gap kept from downloading.
+
+    Translated at the boundary that owns the degradation, the way the Kompress
+    and ONNX loaders do. Public model weights are not data leaving the box, so
+    what the caller needs to hear is "this model is not available here and
+    why", not an air-gap type it has never seen.
+    """
+    if model_name == DEFAULT_MODEL_NAME:
+        seed_hint = _default_model_seed_hint()
+    else:
+        seed_hint = "Pre-seed the fastembed cache on this host, or use the BM25-only scorer."
+    return f"Embedding model {model_name!r} is unavailable: {str(blocked).rstrip('.')}. {seed_hint}"
+
+
+# Output width of DEFAULT_MODEL_NAME, known without loading it.
+DEFAULT_MODEL_DIMENSION = 384
+
+# How long a failed embedding backend is left alone before one call retries it.
+BACKEND_COOLDOWN_SECONDS = 30.0
+
+# Module-level indirection over the clock so tests can drive the circuit
+# breaker without monkeypatching stdlib ``time.monotonic`` for every thread in
+# the process. Same pattern as proxy.helpers and savings_tracker.
+_monotonic = time.monotonic
+
+
+class EmbeddingBackendCircuitOpenError(BackendError):
+    """An embedding backend failed recently, so the call was refused without contacting it.
+
+    Raised by :class:`EmbeddingScorer` while its circuit breaker is open. A
+    :class:`~headroom.relevance.HybridScorer` treats it like any other failure
+    of its embedding half and scores with BM25 alone.
+    """
+
+
+class _CircuitBreaker:
+    """Fail fast for ``cooldown`` seconds after a failure, then let one call probe.
+
+    Closed: every call goes through. A failure opens it: calls are refused
+    until the cooldown ends, after which exactly one call (the probe) goes
+    through while the others keep being refused. The probe's success closes
+    the breaker; its failure starts a new cooldown.
+
+    A remote backend on the request path is the reason this exists: without
+    it a dead endpoint costs every request its full timeout.
+    """
+
+    def __init__(self, cooldown: float) -> None:
+        self.cooldown = cooldown
+        self._lock = threading.Lock()
+        self._open_until: float | None = None  # None while closed
+        self._probing = False
+
+    def admit(self) -> tuple[float | None, bool]:
+        """Decide one call: ``(seconds left to wait or None, whether it is the probe)``.
+
+        A call may go through when the first element is ``None``. A probe must
+        end in :meth:`succeeded`, :meth:`failed` or :meth:`end_probe`.
+        """
+        with self._lock:
+            if self._open_until is None:
+                return None, False
+            remaining = self._open_until - _monotonic()
+            if remaining > 0 or self._probing:
+                return max(remaining, 0.0), False
+            self._probing = True
+            return None, True
+
+    def succeeded(self) -> bool:
+        """Close the breaker. True when it was open, i.e. the backend recovered."""
+        with self._lock:
+            was_open = self._open_until is not None
+            self._open_until = None
+            self._probing = False
+            return was_open
+
+    def failed(self) -> bool:
+        """Start a cooldown. True when this opened a closed breaker."""
+        with self._lock:
+            opened = self._open_until is None
+            self._open_until = _monotonic() + self.cooldown
+            self._probing = False
+            return opened
+
+    def end_probe(self) -> None:
+        """Give back the probe slot; call it after every probe.
+
+        A no-op once :meth:`succeeded` or :meth:`failed` settled the probe. A
+        probe that ended in a BaseException settles neither; this keeps it from
+        wedging the breaker, which stays open with its cooldown spent so the
+        next call probes.
+        """
+        with self._lock:
+            self._probing = False
+
+
+def _cooldown_seconds(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(
+            f"backend_cooldown_seconds must be a positive number of seconds, got {value!r}"
+        )
+    return float(value)
+
+
 def _cosine_similarity(a, b) -> float:
     """Compute cosine similarity between two vectors.
 
@@ -276,27 +424,72 @@ class EmbeddingScorer(RelevanceScorer):
         )
         # score.score > 0.5 (semantic match between "failed"/"error" and "errors")
 
+    With ``backend`` the scorer embeds through that
+    :class:`~headroom.models.backends.EmbeddingBackend` instead of fastembed:
+
+        scorer = EmbeddingScorer(backend="openai:text-embedding-3-small")
+
+    A backend is called through :func:`~headroom.models.backends.embed_texts`,
+    so empty texts are never sent and every response is validated. A failing
+    backend opens a circuit breaker: for ``backend_cooldown_seconds`` calls
+    raise :class:`EmbeddingBackendCircuitOpenError` without contacting it,
+    then one call retries it. That bounds what a dead remote endpoint costs
+    the request path to one timeout per cooldown.
+
     Note:
-        Requires fastembed: pip install "headroom-ai[relevance]"
+        Without a backend, requires fastembed: pip install "headroom-ai[relevance]"
     """
 
     def __init__(
         self,
         model_name: str | None = None,
         cache_model: bool = True,  # Kept for API compatibility
+        *,
+        backend: EmbeddingBackend | str | Callable[[list[str]], Any] | None = None,
+        backend_cooldown_seconds: float = BACKEND_COOLDOWN_SECONDS,
     ):
         """Initialize embedding scorer.
 
         Args:
             model_name: Sentence-embedding model name. Default
                 "BAAI/bge-small-en-v1.5". See fastembed's catalog for
-                supported models (BGE, E5, MiniLM, jina, etc.).
+                supported models (BGE, E5, MiniLM, jina, etc.). Not used
+                with ``backend``, which names its own model.
             cache_model: Deprecated, models are always cached via
                 fastembed's HF Hub cache.
+            backend: Embed with this instead of fastembed: an
+                ``EmbeddingBackend``, a registry spec (``"name"`` or
+                ``"name:model"``) or a function ``fn(list[str]) -> rows``.
+                A spec is constructed here, so a bad one fails now.
+            backend_cooldown_seconds: How long a failed backend is left
+                alone before one call retries it.
+
+        Raises:
+            ValueError: Both ``model_name`` and ``backend`` were given, or the
+                cooldown is not a positive number.
         """
-        self.model_name = model_name or DEFAULT_MODEL_NAME
         self.cache_model = cache_model
         self._model: TextEmbedding | None = None
+        self._model_lock = threading.Lock()
+        self._backend: EmbeddingBackend | None = None
+        if backend is None:
+            self.model_name = model_name or DEFAULT_MODEL_NAME
+            return
+        if model_name is not None:
+            # Picking one silently would score with a model the caller did not ask for.
+            raise ValueError(
+                "Pass model_name or backend, not both; give a registry spec its model as "
+                "'name:model'"
+            )
+        self._breaker = _CircuitBreaker(_cooldown_seconds(backend_cooldown_seconds))
+        self._backend = as_embedding_backend(backend)
+        self._backend_label = _backend_label(self._backend)
+        self.model_name = self._backend.model_name
+
+    @property
+    def backend(self) -> EmbeddingBackend | None:
+        """The embedding backend this scorer uses, or ``None`` for fastembed."""
+        return self._backend
 
     @classmethod
     def is_available(cls) -> bool:
@@ -328,33 +521,20 @@ class EmbeddingScorer(RelevanceScorer):
             )
 
         if self._model is None:
-            try:
-                if self.model_name == DEFAULT_MODEL_NAME:
-                    self._model = _load_default_model()
-                else:
-                    # Other catalog models are not pinned: fastembed resolves
-                    # them on the repo's main, cache first.
-                    self._model = _load_text_embedding({"model_name": self.model_name})
-            except OfflineEgressBlocked as blocked:
-                # Translate at the boundary that owns the degradation, the way
-                # the Kompress and ONNX loaders do. Public model weights are
-                # not data leaving the box, so what the caller needs to hear
-                # is "this model is not available here and why", not an
-                # air-gap type it has never seen.
-                if self.model_name == DEFAULT_MODEL_NAME:
-                    seed_hint = _default_model_seed_hint()
-                else:
-                    seed_hint = (
-                        "Pre-seed the fastembed cache on this host, or use the BM25-only scorer."
-                    )
-                raise RuntimeError(
-                    f"Embedding model {self.model_name!r} is unavailable: "
-                    f"{str(blocked).rstrip('.')}. {seed_hint}"
-                ) from None
+            # Locked so concurrent first requests (parallel relevance splits)
+            # load the model once rather than once each.
+            with self._model_lock:
+                if self._model is None:
+                    try:
+                        self._model = _load_fastembed_model(self.model_name)
+                    except OfflineEgressBlocked as blocked:
+                        raise RuntimeError(
+                            _model_unavailable_message(self.model_name, blocked)
+                        ) from None
         return self._model
 
     def _encode(self, texts: list[str]):
-        """Encode texts to embeddings via fastembed.
+        """Encode texts to embeddings via the backend, or fastembed without one.
 
         fastembed's `embed` returns an iterator yielding numpy arrays
         (one per text). We materialize to a list/np.array for the
@@ -366,12 +546,71 @@ class EmbeddingScorer(RelevanceScorer):
         Returns:
             numpy array of embeddings, shape (len(texts), embedding_dim).
         """
+        if self._backend is not None:
+            return self._encode_with_backend(texts)
         np = _get_numpy()
         model = self._get_model()
         if not getattr(model, "_headroom_arena_shrink_checked", False):
             _shrink_arena_after_each_run(model)
         embeddings = list(model.embed(texts, batch_size=EMBED_BATCH_SIZE))
         return np.array(embeddings)
+
+    def _encode_with_backend(self, texts: list[str]) -> Any:
+        """Embed through the backend, behind the circuit breaker.
+
+        Raises:
+            EmbeddingBackendCircuitOpenError: The backend failed less than a
+                cooldown ago (or another call is already retrying it).
+            Exception: Whatever :func:`embed_texts` raised; it opens the breaker.
+        """
+        assert self._backend is not None
+        remaining, probe = self._breaker.admit()
+        if remaining is not None:
+            wait = (
+                f"retrying in {math.ceil(remaining)}s" if remaining > 0 else "a retry is in flight"
+            )
+            raise EmbeddingBackendCircuitOpenError(
+                f"Embedding backend {self._backend_label!r} failed recently; {wait}"
+            )
+        try:
+            matrix = embed_texts(self._backend, texts)
+        except Exception as exc:
+            self._backend_failed(exc)
+            raise
+        else:
+            if self._breaker.succeeded():
+                logger.info(
+                    "Relevance embedding backend %r recovered; embedding scores resume",
+                    self._backend_label,
+                )
+            return matrix
+        finally:
+            # OfflineEgressBlocked (a BaseException) is a policy refusal, not a
+            # backend failure: it neither opens nor closes the breaker, and it
+            # propagates. Only the probe slot it may hold is given back.
+            if probe:
+                self._breaker.end_probe()
+
+    def _backend_failed(self, exc: Exception) -> None:
+        """Open the breaker and report it: one WARNING per opening, detail at DEBUG.
+
+        The WARNING names the backend and the exception's class only: a
+        third-party backend's message can quote its endpoint, key or input.
+        """
+        if self._breaker.failed():
+            logger.warning(
+                "Relevance embedding backend %r failed (%s); not calling it again for %.0fs, "
+                "then one call retries it. Details are logged at DEBUG.",
+                self._backend_label,
+                describe_class(type(exc)),
+                self._breaker.cooldown,
+            )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Relevance embedding backend %r failed: %s",
+                self._backend_label,
+                describe_exception(exc),
+            )
 
     def score(self, item: str, context: str) -> RelevanceScore:
         """Score item relevance to context using embeddings.
@@ -444,3 +683,92 @@ def embedding_available() -> bool:
         True if fastembed is installed.
     """
     return EmbeddingScorer.is_available()
+
+
+class FastEmbedBackend:
+    """The built-in ``fastembed`` embedding backend: a local ONNX model.
+
+    Registered as ``"fastembed"`` in :data:`~headroom.models.backends.EMBEDDING_BACKENDS`.
+    It loads models exactly the way :class:`EmbeddingScorer` does: the default
+    from its pinned snapshot, any other catalog model through fastembed's own
+    resolution, cache first, with the network fallback refused under
+    ``HEADROOM_OFFLINE``. ORT runs are capped at :data:`EMBED_BATCH_SIZE`
+    texts and shrink their arena where that is measured to help.
+
+    The model is loaded on the first :meth:`embed`, not here, so building the
+    backend (at startup, to validate a configuration) costs no download.
+
+    Args:
+        model: fastembed model id. Defaults to ``BAAI/bge-small-en-v1.5``.
+        dimension: Expected output width. Known (384) for the default model,
+            where any other value is an error; otherwise learnt from the first
+            call, or checked against it when given.
+
+    Raises:
+        RuntimeError: fastembed is not installed.
+        ValueError: ``dimension`` is not a positive integer, or is not the
+            default model's width.
+    """
+
+    name = "fastembed"
+
+    def __init__(self, model: str | None = None, *, dimension: int | None = None) -> None:
+        if not EmbeddingScorer.is_available():
+            raise RuntimeError(
+                "The fastembed embedding backend requires fastembed. "
+                'Install with: pip install "headroom-ai[relevance]"'
+            )
+        self.model_name = (model or "").strip() or DEFAULT_MODEL_NAME
+        declared = _positive_int_or_none(dimension, "dimension")
+        if self.model_name == DEFAULT_MODEL_NAME:
+            if declared not in (None, DEFAULT_MODEL_DIMENSION):
+                raise ValueError(
+                    f"{DEFAULT_MODEL_NAME} produces {DEFAULT_MODEL_DIMENSION}-dimensional "
+                    f"vectors, not {declared}"
+                )
+            declared = DEFAULT_MODEL_DIMENSION
+        self.dimension: int | None = declared
+        self._model: TextEmbedding | None = None
+        self._lock = threading.Lock()
+
+    def _get_model(self) -> TextEmbedding:
+        model = self._model
+        if model is not None:
+            return model
+        with self._lock:
+            if self._model is None:
+                try:
+                    loaded = _load_fastembed_model(self.model_name)
+                except OfflineEgressBlocked as blocked:
+                    # A BackendError, unlike the scorer's plain RuntimeError, so
+                    # embed_texts passes the seeding hint through instead of
+                    # reducing it to an exception class.
+                    raise BackendLoadError(
+                        _model_unavailable_message(self.model_name, blocked)
+                    ) from None
+                _shrink_arena_after_each_run(loaded)
+                self._model = loaded
+            return self._model
+
+    def embed(self, texts: list[str]) -> Any:
+        """Embed ``texts`` and return a float32 matrix, one row per text."""
+        np = _get_numpy()
+        if not texts:
+            return np.zeros((0, self.dimension or 0), dtype=np.float32)
+        model = self._get_model()
+        rows = np.asarray(
+            list(model.embed(list(texts), batch_size=EMBED_BATCH_SIZE)), dtype=np.float32
+        )
+        if rows.ndim == 2:
+            width = int(rows.shape[1])
+            if self.dimension is None:
+                self.dimension = width
+            elif width != self.dimension:
+                raise EmbeddingBackendResponseError(
+                    f"fastembed model {self.model_name!r} produced {width}-dimensional "
+                    f"vectors, not {self.dimension}"
+                )
+        return rows
+
+    def __repr__(self) -> str:
+        return f"FastEmbedBackend(model={self.model_name!r}, dimension={self.dimension!r})"
