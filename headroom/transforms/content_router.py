@@ -5886,10 +5886,14 @@ class ContentRouter(Transform):
             compressor = self._get_kompress()
             if compressor:
                 if compressor is self._get_remote_kompress():
-                    # HEADROOM_KOMPRESS_ENDPOINT runs the model; there is no
-                    # local model to download or warm.
+                    # HEADROOM_KOMPRESS_ENDPOINT or HEADROOM_KOMPRESS_PROVIDER
+                    # runs the model; there is no local model to download or warm.
+                    from .kompress_remote import ProviderKompressCompressor
+
                     status["kompress"] = "enabled"
-                    status["kompress_backend"] = "remote"
+                    status["kompress_backend"] = (
+                        "custom" if isinstance(compressor, ProviderKompressCompressor) else "remote"
+                    )
                 elif not hasattr(compressor, "preload"):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
@@ -6032,10 +6036,16 @@ class ContentRouter(Transform):
         # hosted /compress endpoint so a sandboxed proxy needs no local ML deps.
         # Intercepts BOTH default and custom-model paths (the endpoint's deployed
         # model is authoritative) and bypasses is_kompress_available() — there is
-        # nothing to load locally. The CCR store stays proxy-local.
+        # nothing to load locally. The CCR store stays proxy-local. A Kompress
+        # backend (HEADROOM_KOMPRESS_PROVIDER) takes the same slot, ahead of it.
         remote = self._get_remote_kompress()
         if remote is not None:
             return remote
+        # The provider is set but could not be built; that was reported once at
+        # ERROR. Running the local model instead would silently swap the
+        # compressor the operator chose, so no ML compression runs.
+        if os.environ.get("HEADROOM_KOMPRESS_PROVIDER", "").strip():
+            return None
 
         # Custom model — don't touch self._kompress (that's the default cache)
         if model_id:
@@ -6079,17 +6089,41 @@ class ContentRouter(Transform):
         return self._kompress
 
     def _get_remote_kompress(self) -> Any:
-        """Return a cached RemoteKompressCompressor when HEADROOM_KOMPRESS_ENDPOINT
-        is set, else None.
+        """Return the cached compressor for an off-router Kompress model, else None.
 
-        The endpoint runs the model, so this needs no local ML deps and no
-        is_kompress_available() gate. Cached per ContentRouter instance so the
-        httpx connection pool is reused across requests.
+        Two settings fill this slot, in this order:
+
+        * ``HEADROOM_KOMPRESS_PROVIDER``: a Kompress backend plugin
+          (:mod:`headroom.transforms.kompress_backend`), wrapped in a
+          ProviderKompressCompressor. Rebuilt when the provider variables
+          change. ``None`` when it cannot be built, which ``_get_kompress``
+          turns into "no ML compression" rather than the local model.
+        * ``HEADROOM_KOMPRESS_ENDPOINT``: a RemoteKompressCompressor.
+
+        Neither needs local ML deps or the is_kompress_available() gate. Both
+        are cached per ContentRouter instance in ``_kompress_remote`` (where
+        the proxy's health check finds them) so the backend, worker pool and
+        httpx connection pool are reused across requests.
         """
+        if os.environ.get("HEADROOM_KOMPRESS_PROVIDER", "").strip():
+            from .kompress_remote import provider_kompress_from_env
+
+            # Typed Any like the slot itself: it holds either compressor class.
+            provider: Any = provider_kompress_from_env(
+                getattr(self, "_kompress_remote", None),
+                enable_ccr=self.config.ccr_inject_marker,
+            )
+            self._kompress_remote = provider
+            return provider
         endpoint = os.environ.get("HEADROOM_KOMPRESS_ENDPOINT", "").strip()
         if not endpoint:
             return None
-        if getattr(self, "_kompress_remote", None) is None:
+        from .kompress_remote import ProviderKompressCompressor
+
+        # A provider compressor left in the slot after HEADROOM_KOMPRESS_PROVIDER
+        # was unset is replaced, never served as the endpoint.
+        current = getattr(self, "_kompress_remote", None)
+        if current is None or isinstance(current, ProviderKompressCompressor):
             from .kompress_compressor import KompressConfig
             from .kompress_remote import (
                 DEFAULT_ENDPOINT_PATH,
