@@ -99,7 +99,8 @@ STARTUP_INIT_TIMEOUT_SECONDS = 30.0
 
 
 #: Longest init error kept and logged; an exception message can be unbounded.
-_MAX_INIT_ERROR_CHARS = 500
+#: Room for an ``EmbedderMismatchError`` whole: its recovery steps come last.
+_MAX_INIT_ERROR_CHARS = 1000
 
 
 def _is_configuration_error(exc: Exception) -> bool:
