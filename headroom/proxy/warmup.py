@@ -125,12 +125,14 @@ class WarmupRegistry:
                 if slot.status != "loaded":
                     slot.info["source_status"] = value
 
-        # A remote endpoint is ready at startup; /readyz reports its backend.
+        # A remote endpoint or a Kompress provider plugin is ready at startup;
+        # /readyz reports its backend. Only these fixed router literals are
+        # admitted: /readyz is unauthenticated.
         kompress_backend = status.get("kompress_backend")
         _apply(
             self.kompress,
             status.get("kompress"),
-            **({"backend": kompress_backend} if kompress_backend == "remote" else {}),
+            **({"backend": kompress_backend} if kompress_backend in ("remote", "custom") else {}),
         )
         _apply(self.magika, status.get("magika"))
         _apply(self.code_aware, status.get("code_aware"))
