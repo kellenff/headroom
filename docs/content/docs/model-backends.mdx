@@ -181,7 +181,7 @@ A backend is any object with:
 | `dimension: int \| None` | Output width if known up front, else `None`. |
 | `embed(texts: list[str])` | One row of floats per text, in order, all the same width. A NumPy array or a list of lists. Rows need not be normalised. |
 | `max_batch_size` (optional) | Headroom never sends more texts per call. |
-| `max_tokens` (optional) | The model's input window; memory trims queries to it. |
+| `max_tokens` (optional) | The model's input window, for your own reference. Headroom reports it but does not yet trim input to it. |
 | `close()` (optional) | Release resources. Must be idempotent, and a later `embed` must still work. |
 
 A factory is called with keyword options and must accept `model` and
@@ -198,7 +198,7 @@ a backend that opens network connections must call
 
 | Name | What it runs | Notes |
 |------|--------------|-------|
-| `openai` | Any OpenAI-compatible `POST {base_url}/embeddings` API, over `httpx` | `base_url` defaults to `https://api.openai.com/v1`; `model` is required for any other host. `OPENAI_API_KEY` is used only for api.openai.com, and `OPENAI_BASE_URL` is never read, so a key is not sent to another host by accident. Options: `api_key`, `dimension`, `request_dimensions` (ask `text-embedding-3-*` models for shorter vectors), `headers`, `timeout`, `max_retries`, `max_batch_size`, `max_tokens`. |
+| `openai` | Any OpenAI-compatible `POST {base_url}/embeddings` API, over `httpx` | `base_url` defaults to `https://api.openai.com/v1`; `model` is required for any other host. `OPENAI_API_KEY` is used only for api.openai.com, and `OPENAI_BASE_URL` is never read, so a key is not sent to another host by accident. Options: `api_key`, `dimension`, `request_dimensions` (ask `text-embedding-3-*` models for shorter vectors), `headers`, `timeout`, `max_retries`, `max_batch_size` (default 256; Hugging Face TEI accepts 32 per request unless started with a larger `--max-client-batch-size`, so set `{"max_batch_size": 32}` in `_OPTIONS` for it), `max_tokens`. |
 | `fastembed` | A local [fastembed](https://github.com/qdrant/fastembed) ONNX model | Default `BAAI/bge-small-en-v1.5`, the relevance scorer's own model, loaded from its pinned snapshot. Needs `headroom-ai[relevance]`. |
 | `sentence-transformers` | A local sentence-transformers model | Default `HEADROOM_SENTENCE_TRANSFORMER` or `all-MiniLM-L6-v2`. Needs PyTorch. |
 
@@ -265,16 +265,25 @@ does for `HEADROOM_KOMPRESS_ENDPOINT`:
 
 ```python
 # my_kompress/backend.py
+import functools
+
+
+@functools.cache
+def _shared_model(device: str):
+    return load_model(device=device)  # loaded once per process, on first use
+
+
 class MyCompressor:
     name = "my-compressor"
 
-    def __init__(self, **options):
-        self._model = load_model(**options)
+    def __init__(self, device: str = "cpu"):
+        self._device = device  # cheap: check options here, load nothing
 
     def compress_text(
         self, content: str, *, target_ratio: float | None, question: str | None
     ) -> str:
-        return self._model.shorten(content, ratio=target_ratio, focus=question)
+        model = _shared_model(self._device)
+        return model.shorten(content, ratio=target_ratio, focus=question)
 ```
 
 ```toml
