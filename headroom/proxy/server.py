@@ -852,6 +852,190 @@ def _preflight_offline_egress() -> None:
             )
 
 
+_RELEVANCE_EMBEDDER_PROVIDER_ENV = "HEADROOM_RELEVANCE_EMBEDDER_PROVIDER"
+_KOMPRESS_PROVIDER_ENV = "HEADROOM_KOMPRESS_PROVIDER"
+_KOMPRESS_ENDPOINT_ENV = "HEADROOM_KOMPRESS_ENDPOINT"
+
+
+def _refuse_model_backend(feature: str, reason: str, fix: str) -> None:
+    """Exit 78 for a model-backend selection that cannot work, naming the variable.
+
+    ``reason`` comes from the backend helpers, whose messages name variables
+    and never their values (a value may be a pasted key), and reduce a
+    third-party factory's error to its class name.
+    """
+    msg = f"FATAL: {feature} is misconfigured.\n    error: {reason}\n    fix:   {fix}\n"
+    logger.error(
+        "event=model_backend_config_invalid feature=%r reason=%r action=exit_78",
+        feature,
+        reason,
+    )
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(_EXIT_CONFIG)
+
+
+def _close_preflight_backend(backend: object) -> None:
+    close = getattr(backend, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        # The check is over; a backend that cannot close cleanly is not a
+        # reason to refuse a configuration that just constructed fine.
+        from headroom.log_safety import describe_exception
+
+        logger.debug("preflight backend close failed: %s", describe_exception(exc))
+
+
+def _preflight_model_backends(config: ProxyConfig) -> None:
+    """Refuse, at startup, a model-backend selection that cannot work.
+
+    Covers the operator's three selections: the memory embedder
+    (``HEADROOM_EMBEDDER_*``, when memory runs on the local backend), the
+    relevance-scoring embedder (``HEADROOM_RELEVANCE_EMBEDDER_*``) and the
+    Kompress provider (``HEADROOM_KOMPRESS_PROVIDER``), the last two only when
+    the proxy optimizes. Each selected backend is constructed once and closed:
+    the built-ins open no connection and load no model when constructed, so
+    this catches an unknown name, a malformed variable, a missing model or key
+    and a missing package without touching the network. Without it each of
+    those surfaced later and quieter: memory turned itself off, relevance fell
+    back to BM25, and Kompress stopped compressing, each with one log line.
+
+    Under ``HEADROOM_OFFLINE`` the same construction is what notices a backend
+    that would dial out, because backends call ``guard_egress`` in their
+    constructors. ``OfflineEgressBlocked`` is a ``BaseException`` and is caught
+    by name.
+
+    Nothing is selected by default, so a default deployment does no work here.
+    """
+    from headroom.models.backends import BackendError
+
+    config_errors = (ValueError, TypeError, BackendError)
+
+    if config.memory_enabled and config.memory_backend == "local":
+        from headroom.memory.embedder_env import validate_memory_embedder_env
+
+        feature = "the memory embedder (HEADROOM_EMBEDDER_*)"
+        try:
+            memory_settings = validate_memory_embedder_env()
+            memory_backend = memory_settings.create() if memory_settings else None
+        except OfflineEgressBlocked as blocked:
+            _refuse_offline_egress(
+                blocked,
+                feature,
+                "unset HEADROOM_EMBEDDER_PROVIDER (and HEADROOM_EMBEDDER_RUNTIME=openai) to use "
+                "the built-in local embedder, or unset " + OFFLINE_ENV,
+            )
+        except config_errors as exc:
+            _refuse_model_backend(
+                feature,
+                str(exc),
+                "correct the HEADROOM_EMBEDDER_* variables, or unset HEADROOM_EMBEDDER_PROVIDER "
+                "to use the built-in local embedder",
+            )
+        else:
+            if memory_backend is not None:
+                _close_preflight_backend(memory_backend)
+                logger.info(
+                    "event=model_backend_selected kind=memory_embedder backend=%s source=%s",
+                    memory_settings.name if memory_settings else "",
+                    memory_settings.source if memory_settings else "",
+                )
+
+    if not config.optimize:
+        return
+
+    if (os.environ.get(_RELEVANCE_EMBEDDER_PROVIDER_ENV) or "").strip():
+        from headroom.relevance.backend_config import (
+            EMBEDDING_BACKEND_FROM_ENV,
+            resolve_relevance_embedding_backend,
+        )
+
+        feature = "the relevance-scoring embedder (HEADROOM_RELEVANCE_EMBEDDER_*)"
+        try:
+            relevance_backend = resolve_relevance_embedding_backend(EMBEDDING_BACKEND_FROM_ENV)
+        except OfflineEgressBlocked as blocked:
+            _refuse_offline_egress(
+                blocked,
+                feature,
+                f"unset {_RELEVANCE_EMBEDDER_PROVIDER_ENV} to score relevance with the built-in "
+                "local model, or unset " + OFFLINE_ENV,
+            )
+        except config_errors as exc:
+            _refuse_model_backend(
+                feature,
+                str(exc),
+                "correct the HEADROOM_RELEVANCE_EMBEDDER_* variables, or unset "
+                f"{_RELEVANCE_EMBEDDER_PROVIDER_ENV} to use the built-in local model",
+            )
+        else:
+            if relevance_backend is not None:
+                _close_preflight_backend(relevance_backend)
+                logger.info(
+                    "event=model_backend_selected kind=relevance_embedder backend=%s",
+                    getattr(relevance_backend, "name", ""),
+                )
+
+    if (os.environ.get(_KOMPRESS_PROVIDER_ENV) or "").strip():
+        from headroom.transforms.kompress_backend import (
+            create_kompress_backend,
+            kompress_provider_settings_from_env,
+            validate_kompress_provider_env,
+        )
+
+        feature = "the Kompress provider (HEADROOM_KOMPRESS_PROVIDER)"
+        if (os.environ.get(_KOMPRESS_ENDPOINT_ENV) or "").strip():
+            _refuse_model_backend(
+                feature,
+                f"{_KOMPRESS_PROVIDER_ENV} and {_KOMPRESS_ENDPOINT_ENV} are both set",
+                "set only one: the provider runs a Kompress backend plugin, the endpoint a "
+                "remote Kompress server",
+            )
+        try:
+            name = validate_kompress_provider_env()
+            settings = kompress_provider_settings_from_env()
+            kompress_backend = (
+                create_kompress_backend(settings[0], **settings[1])
+                if name is not None and settings is not None
+                else None
+            )
+        except OfflineEgressBlocked as blocked:
+            _refuse_offline_egress(
+                blocked,
+                feature,
+                f"unset {_KOMPRESS_PROVIDER_ENV} to use the local Kompress model, or unset "
+                + OFFLINE_ENV,
+            )
+        except config_errors as exc:
+            _refuse_model_backend(
+                feature,
+                str(exc),
+                "correct HEADROOM_KOMPRESS_PROVIDER and HEADROOM_KOMPRESS_PROVIDER_OPTIONS, or "
+                f"unset {_KOMPRESS_PROVIDER_ENV} to use the local Kompress model",
+            )
+        else:
+            if kompress_backend is not None:
+                _close_preflight_backend(kompress_backend)
+                logger.info("event=model_backend_selected kind=kompress backend=%s", name)
+
+
+def _apply_relevance_embedder_env(router_config: ContentRouterConfig) -> None:
+    """Hand the operator's ``HEADROOM_RELEVANCE_EMBEDDER_*`` selection to the router.
+
+    Only whether the provider variable is set is looked at here. The router
+    reads the variables when it builds its scorer, and
+    :func:`_preflight_model_backends` checks them at startup. Unset, the
+    config keeps ``embedding_backend=None`` and is unchanged.
+    """
+    if (os.environ.get(_RELEVANCE_EMBEDDER_PROVIDER_ENV) or "").strip():
+        from headroom.relevance.backend_config import EMBEDDING_BACKEND_FROM_ENV
+
+        router_config.relevance = replace(
+            router_config.relevance, embedding_backend=EMBEDDING_BACKEND_FROM_ENV
+        )
+
+
 # Compression pipeline timeout in seconds
 
 
@@ -1129,6 +1313,7 @@ class HeadroomProxy(
         router_config.active_external_compressors = _external_compressor_selection(
             config.compressors
         )
+        _apply_relevance_embedder_env(router_config)
         # No-CCR lossless mode: compress tool outputs with format-native
         # lossless compaction and marker-free SmartCrusher, and suppress every
         # retrieval marker + the retrieve-tool injection so no MCP round-trip is
@@ -2377,6 +2562,10 @@ class HeadroomProxy(
         if self._kompress_status == "enabled":
             if eager_status.get("kompress_backend") == "remote":
                 logger.info("Kompress: ENABLED (remote endpoint; no local model)")
+            elif eager_status.get("kompress_backend") == "custom":
+                logger.info(
+                    "Kompress: ENABLED (provider from %s; no local model)", _KOMPRESS_PROVIDER_ENV
+                )
             else:
                 logger.info("Kompress: ENABLED (ModernBERT token compressor)")
         elif self._kompress_status == "deferred":
@@ -2391,6 +2580,9 @@ class HeadroomProxy(
             or self.config.disable_kompress_openai is True
         ):
             logger.info("Kompress: DISABLED")
+        elif self.config.optimize and (os.environ.get(_KOMPRESS_PROVIDER_ENV) or "").strip():
+            # The router has logged why at ERROR; the package hint would mislead.
+            logger.info("Kompress: UNAVAILABLE (the %s backend failed)", _KOMPRESS_PROVIDER_ENV)
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -2442,7 +2634,11 @@ class HeadroomProxy(
                     # we can reach, or the backend simply exposes no handle.
                     self.warmup.memory_embedder.mark_null()
             else:
-                if self.warmup.memory_backend.status != "error":
+                if self.memory_handler.init_error:
+                    # A configuration error or an air-gap refusal: init is not
+                    # retried, so report it rather than an empty slot.
+                    self.warmup.memory_backend.mark_error(self.memory_handler.init_error)
+                elif self.warmup.memory_backend.status != "error":
                     self.warmup.memory_backend.mark_null()
                 self.warmup.memory_embedder.mark_null()
             logger.info(
@@ -3619,6 +3815,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _rust_core_error,
             )
 
+        _preflight_model_backends(config)
         _configure_observability_or_refuse()
 
         app.state.started_at = time.time()

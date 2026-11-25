@@ -1,18 +1,19 @@
 """Pluggable model backends.
 
-Headroom runs several models of its own: text embeddings for memory, relevance
-scoring and the semantic cache, the Kompress compression model, and the image
-technique router. This package lets each be replaced by a backend you choose: a
-built-in (for example an OpenAI-compatible embedding server), a function or
-object you pass in, or a third-party package registered through an entry point.
+Headroom runs models of its own: text embeddings for memory and relevance
+scoring, and the Kompress compression model. This package lets each be replaced
+by a backend you choose: a built-in (for example an OpenAI-compatible embedding
+server), a function or object you pass in, or a third-party package registered
+through an entry point.
 
 Each kind of backend has its own contract, registry and entry-point group:
 
-=================  ===============================  ====================================
+=================  ===============================  =========================================
 Kind               Entry-point group                Contract
-=================  ===============================  ====================================
+=================  ===============================  =========================================
 text embeddings    ``headroom.embedding_backend``   :class:`EmbeddingBackend`
-=================  ===============================  ====================================
+Kompress model     ``headroom.kompress_backend``    :class:`headroom.transforms.kompress_backend.KompressModelBackend`
+=================  ===============================  =========================================
 
 Backends are selected by explicit name only; installing a package never changes
 behaviour. See ``docs/content/docs/model-backends.mdx``.

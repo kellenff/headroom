@@ -12,7 +12,8 @@ downloads (codebase-memory-mcp among them), litellm's import-time pricing-table
 refresh, CrewAI's import-time install tracking, eval dataset downloads and the
 provider SDK clients the eval harness drives, GitHub Copilot device-flow auth and token
 exchange, the Anthropic / Codex / Copilot subscription pollers, the OpenAI
-embedders, both Headroom Cloud compression integrations, and the TLS
+embedders (the pluggable ``openai`` embedding backend among them, loopback
+base URLs included), both Headroom Cloud compression integrations, and the TLS
 diagnostics (``doctor --network`` endpoint checks and the certificate-chain
 re-probe after an upstream TLS failure).
 
