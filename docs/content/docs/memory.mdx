@@ -222,8 +222,9 @@ headroom proxy --memory --memory-db-path .headroom/custom-embeddings/memory.db
 
 The dimension is required. Use the model's native output size: it sizes the
 index and every response is checked against it. The base URL includes any API
-prefix (such as `/v1`); Headroom appends `/embeddings`. `OPENAI_BASE_URL` is not
-read, and `OPENAI_API_KEY` is used only for api.openai.com. Requests send `model`,
+prefix (such as `/v1`); Headroom appends `/embeddings`. `OPENAI_BASE_URL` and
+`OPENAI_API_KEY` are not read; without a base URL the server is api.openai.com,
+and `HEADROOM_EMBEDDER_API_KEY` is then required. Requests send `model`,
 `input` and `encoding_format="float"`. Each response must hold one finite vector
 of the configured size per input, and Headroom restores input order and
 normalizes the vectors. `HEADROOM_OFFLINE=1` refuses this backend, including for

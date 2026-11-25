@@ -41,7 +41,10 @@ headroom proxy --memory --memory-db-path .headroom/custom-embeddings/memory.db
 `HEADROOM_EMBEDDER_DIMENSION` is required for memory: it sizes the vector index
 and every response is checked against it. Use the model's native output size.
 `HEADROOM_EMBEDDER_RUNTIME=openai` is accepted as another spelling of
-`HEADROOM_EMBEDDER_PROVIDER=openai`.
+`HEADROOM_EMBEDDER_PROVIDER=openai`. Without a `HEADROOM_EMBEDDER_BASE_URL`
+the backend calls api.openai.com, and then `HEADROOM_EMBEDDER_API_KEY` is
+required: the proxy never reuses its chat credential, `OPENAI_API_KEY`, for
+embeddings.
 
 Every process that opens the same memory database must use the same embedder;
 see [one embedding space per database](#one-embedding-space-per-database).
@@ -198,9 +201,9 @@ a backend that opens network connections must call
 
 | Name | What it runs | Notes |
 |------|--------------|-------|
-| `openai` | Any OpenAI-compatible `POST {base_url}/embeddings` API, over `httpx` | `base_url` defaults to `https://api.openai.com/v1`; `model` is required for any other host. `OPENAI_API_KEY` is used only for api.openai.com, and `OPENAI_BASE_URL` is never read, so a key is not sent to another host by accident. Options: `api_key`, `dimension`, `request_dimensions` (ask `text-embedding-3-*` models for shorter vectors), `headers`, `timeout`, `max_retries`, `max_batch_size` (default 256; Hugging Face TEI accepts 32 per request unless started with a larger `--max-client-batch-size`, so set `{"max_batch_size": 32}` in `_OPTIONS` for it), `max_tokens`. |
+| `openai` | Any OpenAI-compatible `POST {base_url}/embeddings` API, over `httpx` | `base_url` defaults to `https://api.openai.com/v1`; `model` is required for any other host. Constructed in Python without an `api_key`, it falls back to `OPENAI_API_KEY` for api.openai.com only; a selection through the `HEADROOM_*EMBEDDER_*` variables must set its own `_API_KEY`. `OPENAI_BASE_URL` is never read, so a key is not sent to another host by accident. Header names must be HTTP tokens and values printable ASCII; a custom `Authorization` or `Content-Type`, in any letter case, replaces the default one. A malformed URL, port or header is refused when the backend is constructed. Options: `api_key`, `dimension`, `request_dimensions` (ask `text-embedding-3-*` models for shorter vectors), `headers`, `timeout`, `max_retries`, `max_batch_size` (default 256; Hugging Face TEI accepts 32 per request unless started with a larger `--max-client-batch-size`, so set `{"max_batch_size": 32}` in `_OPTIONS` for it), `max_tokens`. |
 | `fastembed` | A local [fastembed](https://github.com/qdrant/fastembed) ONNX model | Default `BAAI/bge-small-en-v1.5`, the relevance scorer's own model, loaded from its pinned snapshot. Needs `headroom-ai[relevance]`. |
-| `sentence-transformers` | A local sentence-transformers model | Default `HEADROOM_SENTENCE_TRANSFORMER` or `all-MiniLM-L6-v2`. Needs PyTorch. |
+| `sentence-transformers` | A local sentence-transformers model | Default `HEADROOM_SENTENCE_TRANSFORMER` or `all-MiniLM-L6-v2`. Needs `headroom-ai[memory]` (sentence-transformers and PyTorch); without it the backend fails to construct. |
 
 Built-in names cannot be taken over by a plugin. If two installed packages
 register the same name, selecting it is an error rather than a coin toss.
@@ -215,7 +218,7 @@ Memory reads the `HEADROOM_EMBEDDER_*` family and relevance scoring reads
 | `_PROVIDER` | Backend name (`openai`, `fastembed`, `sentence-transformers`, or a plugin's entry-point name). Unset keeps the built-in default. For relevance, `memory` reuses the memory settings. |
 | `_MODEL` | Model id. |
 | `_BASE_URL` | Endpoint for remote backends, including any `/v1` prefix. |
-| `_API_KEY` | Credential for remote backends, independent of the proxy's chat credentials. |
+| `_API_KEY` | Credential for remote backends, independent of the proxy's chat credentials. Required for `openai` on api.openai.com; `OPENAI_API_KEY` is never used for these variables. |
 | `_DIMENSION` | Output width. Required for memory. |
 | `_HEADERS` | Extra request headers as `Name=value` pairs separated by commas. |
 | `_OPTIONS` | A JSON object of further backend options, for example `{"timeout": 10}`. |
@@ -224,29 +227,54 @@ Memory reads the `HEADROOM_EMBEDDER_*` family and relevance scoring reads
 embedder (`cpu`, `pytorch_mps`) and cannot be combined with
 `HEADROOM_EMBEDDER_PROVIDER`, apart from `cpu` and the `openai` alias.
 
-The proxy checks every selection at startup: the memory embedder when memory
-runs on the `local` backend, and the relevance embedder and Kompress provider
-when the proxy optimizes. It constructs each selected backend once and closes
-it. An unknown backend name, a malformed value, a backend that fails to
-construct (a missing model, key or package), or one that would dial out under
-`HEADROOM_OFFLINE` stops the proxy with exit code 78 and a message that names
-the variable, instead of quietly running without the feature. The built-in
-backends open no connection and load no model when constructed; a plugin
-should do the same.
+The proxy checks every selection at startup:
+
+- the memory embedder, when memory runs on the `local` backend (memory is off
+  in stateless mode, so it is not checked there);
+- the relevance embedder;
+- the Kompress provider, unless Kompress is turned off for every provider.
+
+The last two are checked whether or not the proxy optimizes traffic, because
+`/v1/compress` uses them either way. The proxy constructs each selected backend
+once and closes it. Any of these stops the proxy with a message that names the
+variable, instead of quietly running without the feature:
+
+- an unknown backend name or a malformed value;
+- a backend that fails to construct (a missing model, key or package);
+- a memory backend whose width differs from `HEADROOM_EMBEDDER_DIMENSION`;
+- a backend that would dial out under `HEADROOM_OFFLINE`.
+
+`headroom proxy` then exits with status 78 (`EX_CONFIG`), which process
+supervisors treat as a configuration error rather than a crash. An app you
+serve yourself from `create_app` with uvicorn fails its startup instead, and
+uvicorn exits with status 3. The built-in backends open no connection and load
+no model when constructed; a plugin should do the same.
 
 ## One embedding space per database
 
 Vectors from different models cannot be compared, even when their widths
-match. Each memory database records which embedder wrote it (backend, model and
-dimension) the first time it is opened. A later open with a different embedder
-is refused with an `EmbedderMismatchError` that names both. This covers the
-proxy, `headroom memory` commands, the memory MCP server and memory sync, so
-set the same `HEADROOM_EMBEDDER_*` variables everywhere they run, or give each
-embedder its own memory directory. Existing vectors are never migrated or
-re-embedded.
+match. Each memory database records which embedder wrote it: the backend, the
+model it actually serves (its default model, when none is set) and the
+dimension. A later open with a different embedder is refused with an
+`EmbedderMismatchError` that names both. This covers the proxy,
+`headroom memory` commands, the memory MCP server and memory sync, so set the
+same `HEADROOM_EMBEDDER_*` variables everywhere they run, or give each embedder
+its own memory directory. Existing vectors are never migrated or re-embedded.
+
+A database written before this record existed has none. The first open records
+its embedder only if the stored vectors have that embedder's width; otherwise
+the open is refused, nothing is recorded, and the embedder that wrote the
+vectors can still open it. If a wrong embedder was recorded anyway, remove the
+record and open the database with the right settings:
+
+```bash
+python -c "from headroom.memory.embedder_identity import clear_embedder_identity; print(clear_embedder_identity('.headroom/memory.db'))"
+```
 
 The built-in ONNX and sentence-transformers MiniLM embedders produce the same
-space and share one identity. Set `HEADROOM_EMBEDDER_IDENTITY_CHECK=0`, or
+space and share one identity, whether the model is the default embedder or
+selected with `HEADROOM_EMBEDDER_PROVIDER=sentence-transformers`. Set
+`HEADROOM_EMBEDDER_IDENTITY_CHECK=0`, or
 `LocalBackendConfig(enforce_embedder_identity=False)`, only when you know two
 identities are interchangeable.
 
@@ -303,8 +331,10 @@ at least 64 words. It must be thread-safe and deterministic, because compressed
 blocks are cached and re-sent as a stable prompt prefix. Each call is capped by
 the request's ML time budget and at most 20 seconds. A call that runs over is
 abandoned, not interrupted, so put a timeout on any I/O. An optional `close()`
-is called when the compressor is closed. The proxy builds one instance per
-pipeline, so share a heavy in-process model between instances.
+is called when the compressor is closed, or replaced after the selection
+changes. The proxy constructs one instance per pipeline, and one more at
+startup to check the selection, so keep the constructor cheap and share a heavy
+in-process model between instances, as above.
 
 Set `HEADROOM_KOMPRESS_PROVIDER` or `HEADROOM_KOMPRESS_ENDPOINT`, not both. The
 proxy refuses to start with both; elsewhere the provider wins and a warning is
@@ -335,7 +365,9 @@ operator-configured loopback endpoint.
 ## Errors and logs
 
 Backend errors name the kind, the backend and, for third-party code, only the
-exception's class. A plugin's own message can contain a URL with a key, or the
+exception's class. That holds for anything a plugin raises, subclasses of
+Headroom's own `BackendError` included; only Headroom's built-in backends keep
+their messages. A plugin's own message can contain a URL with a key, or the
 text being embedded, so it is logged only at DEBUG, and in full only with
 `HEADROOM_DEBUG_DUMP=full`. The same applies to error bodies returned by an
 embedding API.

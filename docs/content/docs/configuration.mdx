@@ -438,7 +438,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_EMBEDDER_PROVIDER` | Replace the memory embedder with a [model backend](/docs/model-backends): `openai` (any OpenAI-compatible `/embeddings` API), `fastembed`, `sentence-transformers`, or a plugin's name. | built-in embedder |
 | `HEADROOM_EMBEDDER_MODEL` | Model id for the memory embedding backend. Required by `openai` for any host other than api.openai.com. | backend default |
 | `HEADROOM_EMBEDDER_BASE_URL` | Endpoint of a remote memory embedding backend, including any `/v1` prefix; Headroom appends `/embeddings`. | `https://api.openai.com/v1` |
-| `HEADROOM_EMBEDDER_API_KEY` | Credential for the memory embedding backend, separate from chat credentials. Optional for servers without authentication. | unset |
+| `HEADROOM_EMBEDDER_API_KEY` | Credential for the memory embedding backend, separate from chat credentials. Required for `openai` on api.openai.com, because `OPENAI_API_KEY` is never used for embeddings; optional for servers without authentication. | unset |
 | `HEADROOM_EMBEDDER_DIMENSION` | Output vector size of the memory embedding backend. Required with a provider; sizes the memory index and validates every response. | unset |
 | `HEADROOM_EMBEDDER_HEADERS` / `HEADROOM_EMBEDDER_OPTIONS` | Extra request headers (`Name=value,...`) and a JSON object of further backend options. | unset |
 | `HEADROOM_EMBEDDER_IDENTITY_CHECK` | `0` lets a memory database be opened with an embedder other than the one that wrote it. See [one embedding space per database](/docs/model-backends#one-embedding-space-per-database). | `1` |
