@@ -1461,6 +1461,8 @@ async def test_init_backend_locked_local_and_bridge_import(
         "embedder_backend": "onnx",
         "embedder_model": "all-MiniLM-L6-v2",
         "vector_dimension": 384,
+        "openai_api_key": None,
+        "openai_base_url": None,
     }
 
 

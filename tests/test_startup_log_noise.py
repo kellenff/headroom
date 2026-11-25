@@ -12,6 +12,7 @@ from __future__ import annotations
 import builtins
 import importlib
 import logging
+import subprocess
 import sys
 import warnings
 from types import ModuleType
@@ -83,14 +84,25 @@ class TestAnthropicWarnParameter:
 class TestEmbedderLogLevels:
     """headroom.memory.adapters.embedders must set specific logger levels at import time."""
 
-    def test_huggingface_hub_logger_is_error_or_higher(self):
-        """huggingface_hub logger must be silenced to ERROR or above."""
-        import headroom.memory.adapters.embedders  # noqa: F401
-
-        level = logging.getLogger("huggingface_hub").level
-        assert level >= logging.ERROR, (
-            f"Expected huggingface_hub logger level >= ERROR ({logging.ERROR}), got {level}"
+    def test_huggingface_hub_logger_is_error_or_higher(self, monkeypatch):
+        """A late HF import must preserve the embedder's quiet startup default."""
+        monkeypatch.delenv("HF_HUB_VERBOSITY", raising=False)
+        monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import logging\n"
+                "import headroom.memory.adapters.embedders\n"
+                "from huggingface_hub.utils import logging as hf_logging\n"
+                "level = logging.getLogger('huggingface_hub').level\n"
+                "assert level >= logging.ERROR, level\n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
+        assert result.returncode == 0, result.stderr
 
     def test_httpx_logger_is_warning_or_higher(self):
         """httpx logger must be set to WARNING or above to suppress HEAD request INFO lines."""

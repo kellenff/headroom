@@ -424,6 +424,7 @@ class BackendRouter:
                 embedder_model=template.embedder_model,
                 vector_dimension=template.vector_dimension,
                 openai_api_key=template.openai_api_key,
+                openai_base_url=template.openai_base_url,
                 ollama_base_url=template.ollama_base_url,
                 graph_persist=template.graph_persist,
                 graph_cache_size_kb=template.graph_cache_size_kb,

@@ -78,6 +78,7 @@ class MemoryConfig:
         embedder_backend: Which embedder to use for generating embeddings.
         embedder_model: Model name/identifier for the embedder.
         openai_api_key: API key for OpenAI embeddings (if using OpenAI backend).
+        openai_base_url: Optional OpenAI-compatible embedding API base URL.
         ollama_base_url: Base URL for Ollama server (if using Ollama backend).
 
         cache_enabled: Whether to enable the memory cache layer.
@@ -120,7 +121,7 @@ class MemoryConfig:
     # Embedder
     embedder_backend: EmbedderBackend = EmbedderBackend.LOCAL
     embedder_model: str = field(default_factory=lambda: ML_MODEL_DEFAULTS.sentence_transformer)
-    openai_api_key: str | None = None
+    openai_api_key: str | None = field(default=None, repr=False)
     ollama_base_url: str = "http://localhost:11434"
 
     # Cache
@@ -130,6 +131,9 @@ class MemoryConfig:
     # Bubbling defaults
     auto_bubble: bool = True
     bubble_threshold: float = 0.7  # Minimum importance for bubbling
+
+    # OpenAI-compatible embedding service; None uses the SDK's default endpoint.
+    openai_base_url: str | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""

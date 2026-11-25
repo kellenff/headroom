@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 # We operate in an authenticated-optional mode; warnings are not actionable.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 # Also silence the huggingface_hub logger which emits rate-limit advisory messages.
@@ -692,10 +694,27 @@ class OnnxLocalEmbedder:
 # =============================================================================
 
 
-class OpenAIEmbedder:
-    """OpenAI API-based embedding generation.
+def _parse_api_embeddings(data: Any, count: int, dimension: int) -> list[np.ndarray]:
+    """Check provider vectors and restore request order before indexing them."""
+    if sorted(item.index for item in data) != list(range(count)):
+        raise ValueError("Embedding API response indices must cover every input exactly once")
+    vectors = [
+        np.asarray(item.embedding, dtype=np.float32)
+        for item in sorted(data, key=lambda item: item.index)
+    ]
+    for vector in vectors:
+        if vector.shape != (dimension,):
+            raise ValueError(f"Embedding API returned the wrong dimension; expected {dimension}")
+        if not np.isfinite(vector).all():
+            raise ValueError("Embedding API returned non-finite values")
+    return vectors
 
-    Uses OpenAI's text-embedding-3-small model for high-quality embeddings.
+
+class OpenAIEmbedder:
+    """OpenAI-compatible API embedding generation.
+
+    Uses OpenAI's text-embedding-3-small model by default. Custom services can
+    supply their own base URL, model name, and expected vector dimension.
     Requires an API key (constructor parameter or OPENAI_API_KEY env var).
 
     Features:
@@ -724,6 +743,9 @@ class OpenAIEmbedder:
         api_key: str | None = None,
         model_name: str | None = None,
         max_retries: int | None = None,
+        *,
+        base_url: str | None = None,
+        dimension: int = DEFAULT_DIMENSION,
     ) -> None:
         """Initialize the OpenAI embedder.
 
@@ -732,6 +754,8 @@ class OpenAIEmbedder:
                     environment variable.
             model_name: Model to use. Defaults to "text-embedding-3-small".
             max_retries: Maximum number of retries for transient failures.
+            base_url: OpenAI-compatible API base URL, including any /v1 prefix.
+            dimension: Expected output vector size; does not request dimension reduction.
 
         Raises:
             ImportError: If openai library is not installed.
@@ -747,6 +771,23 @@ class OpenAIEmbedder:
             )
 
         self._model_name = model_name or self.DEFAULT_MODEL
+        if dimension < 1:
+            raise ValueError("dimension must be positive")
+        self._dimension = dimension
+        self._base_url = (
+            base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        )
+        endpoint = urlsplit(self._base_url)
+        if (
+            endpoint.scheme not in {"http", "https"}
+            or not endpoint.hostname
+            or endpoint.username is not None
+            or endpoint.query
+            or endpoint.fragment
+        ):
+            raise ValueError(
+                "base_url must be an HTTP(S) URL without credentials, query, or fragment"
+            )
         self._max_retries = max_retries if max_retries is not None else self.MAX_RETRIES
         self._client = None
 
@@ -762,10 +803,10 @@ class OpenAIEmbedder:
     @cached_property
     def _async_client(self) -> Any:
         """Lazy initialization of async OpenAI client."""
-        guard_egress("OpenAI embedding API", "api.openai.com")
+        guard_egress("OpenAI-compatible embedding API", urlsplit(self._base_url).hostname)
         from openai import AsyncOpenAI
 
-        return AsyncOpenAI(api_key=self._api_key)
+        return AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
 
     async def _embed_with_retry(self, texts: list[str]) -> list[np.ndarray]:
         """Call OpenAI API with retry logic for transient failures.
@@ -788,10 +829,9 @@ class OpenAIEmbedder:
                 response = await self._async_client.embeddings.create(
                     model=self._model_name,
                     input=texts,
+                    encoding_format="float",
                 )
-                # Extract embeddings in order
-                embeddings = [np.array(item.embedding, dtype=np.float32) for item in response.data]
-                return embeddings
+                return _parse_api_embeddings(response.data, len(texts), self.dimension)
 
             except (APIConnectionError, APITimeoutError, RateLimitError) as e:
                 last_error = e
@@ -881,7 +921,7 @@ class OpenAIEmbedder:
     @property
     def dimension(self) -> int:
         """Return the dimension of generated embeddings."""
-        return self.DEFAULT_DIMENSION
+        return self._dimension
 
     @property
     def model_name(self) -> str:
