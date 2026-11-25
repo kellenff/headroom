@@ -78,11 +78,13 @@ from typing import Any, TypeVar
 import httpx
 
 from ..log_safety import WarnOnce, describe_class, describe_exception
-from ..models.backends.registry import NAME_RE, BackendError
+from ..models.backends.registry import NAME_RE, BackendLoadError, UnknownBackendError
 from ..offline import guard_egress
 from .kompress_backend import (
     KOMPRESS_PROVIDER_ENV,
     KOMPRESS_PROVIDER_OPTIONS_ENV,
+    KompressBackendCallError,
+    KompressBackendResponseError,
     KompressModelBackend,
     call_kompress_backend,
     create_kompress_backend,
@@ -622,6 +624,27 @@ def _backend_label(backend: object) -> str:
     return describe_class(type(backend))
 
 
+# Exception classes whose messages Headroom writes itself, without option
+# values or third-party text, so they may be logged. Matched exactly, never by
+# subclass: a plugin can subclass any public one and put a key in its message.
+_SAFE_CALL_ERRORS: tuple[type[BaseException], ...] = (
+    KompressBackendCallError,
+    KompressBackendResponseError,
+    _BudgetExceeded,
+)
+_SAFE_SELECTION_ERRORS: tuple[type[BaseException], ...] = (
+    UnknownBackendError,
+    BackendLoadError,
+    ValueError,  # a malformed variable, named without its value
+    TypeError,  # a factory that returned a non-backend
+)
+
+
+def _safe_detail(exc: BaseException, safe: tuple[type[BaseException], ...]) -> str:
+    """``str(exc)`` when Headroom wrote it, else the exception's class."""
+    return str(exc) if type(exc) in safe else describe_class(type(exc))
+
+
 class ProviderKompressCompressor(DelegatedKompressCompressor):
     """Kompress backed by a :class:`~headroom.transforms.kompress_backend.KompressModelBackend`.
 
@@ -708,10 +731,7 @@ class ProviderKompressCompressor(DelegatedKompressCompressor):
         logger.debug("Kompress provider %r failed: %s", self.provider, describe_exception(exc))
         # Headroom's own errors are worded to be safe to log; anything else is
         # named by its class only.
-        if isinstance(exc, (BackendError, _BudgetExceeded)):
-            detail = str(exc)
-        else:
-            detail = describe_class(type(exc))
+        detail = _safe_detail(exc, _SAFE_CALL_ERRORS)
         cause = exc.__cause__
         key = (
             self.provider,
@@ -826,14 +846,10 @@ def provider_kompress_from_env(
             _failed_selections.add(key)
         if first:
             logger.debug("Kompress provider selection failed: %s", describe_exception(exc))
-            # Every exception raised above is Headroom's own and worded without
-            # option values or third-party messages (the registry wraps factory
-            # errors); anything else is named by its class.
-            detail = (
-                str(exc)
-                if isinstance(exc, (BackendError, ValueError, TypeError))
-                else describe_class(type(exc))
-            )
+            # The exceptions raised above are Headroom's own and worded without
+            # option values or third-party messages (create_kompress_backend
+            # wraps every factory error); anything else is named by its class.
+            detail = _safe_detail(exc, _SAFE_SELECTION_ERRORS)
             logger.error(
                 "Kompress: %s is set but cannot be used (%s). ML compression (Kompress) is "
                 "disabled; fix or unset %s.",
