@@ -56,6 +56,7 @@
     "configuration",
     "codex-recovery",
     "pipeline-extensions",
+    "model-backends",
     "filesystem-contract",
     "---Observability---",
     "savings",

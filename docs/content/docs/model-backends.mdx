@@ -1,0 +1,292 @@
+---
+title: Model Backends
+description: Replace the models Headroom runs itself — text embeddings for memory and relevance scoring, and the Kompress compression model — with a remote API, your own Python function, or a pip-installed plugin.
+---
+
+Headroom runs a few models of its own. Text embeddings index and search
+[memory](/docs/memory) and score tool output against the prompt before
+compression. Kompress, the compression model, shortens prose and logs. Each one
+has a built-in default that works out of the box. A **model backend** replaces
+it with something you choose:
+
+- a built-in alternative, such as any OpenAI-compatible `/embeddings` server
+  (OpenAI, vLLM, Hugging Face TEI, LM Studio, llama.cpp, Ollama's `/v1`);
+- a function or object you pass in from Python;
+- a third-party package that registers itself under an entry point.
+
+A backend is used only when you select it by name. Installing a package never
+changes behaviour on its own.
+
+| What | Default | Select a backend with | Plugin entry-point group |
+|------|---------|-----------------------|--------------------------|
+| Memory embeddings | ONNX `all-MiniLM-L6-v2` (proxy), sentence-transformers (library) | `HEADROOM_EMBEDDER_PROVIDER`, or `MemoryConfig(embedder=...)` | `headroom.embedding_backend` |
+| Relevance-scoring embeddings | fastembed `BAAI/bge-small-en-v1.5` | `HEADROOM_RELEVANCE_EMBEDDER_PROVIDER`, or `create_scorer(embedding_backend=...)` | `headroom.embedding_backend` |
+| Kompress compression model | local ModernBERT (ONNX/PyTorch) | `HEADROOM_KOMPRESS_PROVIDER` | `headroom.kompress_backend` |
+
+## Recipes
+
+### Use a remote embedding server for memory (proxy)
+
+```bash
+export HEADROOM_EMBEDDER_PROVIDER=openai
+export HEADROOM_EMBEDDER_BASE_URL=https://embeddings.example.com/v1
+export HEADROOM_EMBEDDER_MODEL=your-embedding-model
+export HEADROOM_EMBEDDER_DIMENSION=1024
+export HEADROOM_EMBEDDER_API_KEY="$EMBEDDING_API_KEY"   # omit for unauthenticated servers
+
+mkdir -p .headroom/custom-embeddings
+headroom proxy --memory --memory-db-path .headroom/custom-embeddings/memory.db
+```
+
+`HEADROOM_EMBEDDER_DIMENSION` is required for memory: it sizes the vector index
+and every response is checked against it. Use the model's native output size.
+`HEADROOM_EMBEDDER_RUNTIME=openai` is accepted as another spelling of
+`HEADROOM_EMBEDDER_PROVIDER=openai`.
+
+Every process that opens the same memory database must use the same embedder;
+see [one embedding space per database](#one-embedding-space-per-database).
+
+### Reuse it for relevance scoring
+
+```bash
+export HEADROOM_RELEVANCE_EMBEDDER_PROVIDER=memory
+```
+
+`memory` reuses the `HEADROOM_EMBEDDER_*` settings: one server, one key. To
+point relevance scoring somewhere else, set the `HEADROOM_RELEVANCE_EMBEDDER_*`
+family instead (same suffixes as memory, listed
+[below](#environment-variables)). Relevance runs on the request path, so the
+built-in `openai` backend defaults there to a 5-second timeout and no retries.
+After a failure it backs off for 30 seconds, and the request falls back to
+BM25 keyword scoring.
+
+<Callout type="warn" title="Content leaves the box">
+Relevance scoring sends the user's prompt and the tool output being compressed
+to the embedding server. Memory sends memories and search queries. Point these
+at servers you trust with that content.
+</Callout>
+
+### Use your own Python function
+
+Anything that maps a list of strings to one vector per string works:
+
+```python
+from headroom.memory import Memory, MemoryConfig
+from headroom.relevance import create_scorer
+
+def embed(texts: list[str]) -> list[list[float]]:
+    return my_model.encode(texts).tolist()
+
+# Memory: easy API, or the full config
+memory = Memory(embedder=embed, vector_dimension=768)
+config = MemoryConfig(embedder=embed, vector_dimension=768)
+
+# Relevance scoring
+scorer = create_scorer("hybrid", embedding_backend=embed)
+```
+
+Wrap it in `CallableEmbeddingBackend(embed, dimension=768, model_name="my-model",
+max_batch_size=64)` to give it a name, a known width or a batch limit.
+`SemanticCache` already takes a function; adapt a backend with
+`embedding_fn=lambda q: embed_texts(backend, [q], normalize=True)[0].tolist()`.
+
+### Ship a backend as a package
+
+A backend class, or any factory returning one, registered under the
+`headroom.embedding_backend` entry-point group:
+
+```python
+# my_embedder/backend.py
+class MyEmbedder:
+    name = "my-embedder"
+
+    def __init__(self, model: str | None = None, dimension: int | None = None, **options):
+        self.model_name = model or "my-default-model"
+        self.dimension = dimension          # or the width you know, or None
+        self.max_batch_size = 128           # optional
+        self._client = build_client(**options)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._client.embed(texts)
+
+    def close(self) -> None:                # optional; must be safe to call twice
+        self._client.close()
+```
+
+```toml
+# pyproject.toml
+[project.entry-points."headroom.embedding_backend"]
+my-embedder = "my_embedder.backend:MyEmbedder"
+```
+
+After `pip install my-embedder` (or `pip install -e .`), select it anywhere by
+name: `HEADROOM_EMBEDDER_PROVIDER=my-embedder`,
+`HEADROOM_RELEVANCE_EMBEDDER_PROVIDER=my-embedder`,
+`MemoryConfig(embedder_backend=EmbedderBackend.EXTERNAL, embedder_backend_name="my-embedder:my-model")`
+or `create_scorer(embedding_backend="my-embedder")`. Options from
+`*_BASE_URL`, `*_API_KEY`, `*_HEADERS` and `*_OPTIONS` arrive as keyword
+arguments.
+
+In Python you can also register one without packaging it:
+
+```python
+from headroom.models.backends import register_embedding_backend
+
+register_embedding_backend("my-embedder", MyEmbedder)
+```
+
+## The embedding backend contract
+
+A backend is any object with:
+
+| Member | Meaning |
+|--------|---------|
+| `name: str` | Backend id, shown in errors and logs. |
+| `model_name: str` | The model it serves. |
+| `dimension: int \| None` | Output width if known up front, else `None`. |
+| `embed(texts: list[str])` | One row of floats per text, in order, all the same width. A NumPy array or a list of lists. Rows need not be normalised. |
+| `max_batch_size` (optional) | Headroom never sends more texts per call. |
+| `max_tokens` (optional) | The model's input window; memory trims queries to it. |
+| `close()` (optional) | Release resources. Must be idempotent, and a later `embed` must still work. |
+
+A factory is called with keyword options and must accept `model` and
+`dimension` (either may be `None`).
+
+Headroom guarantees that `embed` never receives an empty or whitespace-only
+text (those rows come back as zeros) and checks every response: row count,
+width, and finite values. A backend must be thread-safe and deterministic, and
+a backend that opens network connections must call
+`headroom.offline.guard_egress()` in its constructor and before each request
+(see [air-gapped deployments](#air-gapped-deployments)).
+
+## Built-in embedding backends
+
+| Name | What it runs | Notes |
+|------|--------------|-------|
+| `openai` | Any OpenAI-compatible `POST {base_url}/embeddings` API, over `httpx` | `base_url` defaults to `https://api.openai.com/v1`; `model` is required for any other host. `OPENAI_API_KEY` is used only for api.openai.com, and `OPENAI_BASE_URL` is never read, so a key is not sent to another host by accident. Options: `api_key`, `dimension`, `request_dimensions` (ask `text-embedding-3-*` models for shorter vectors), `headers`, `timeout`, `max_retries`, `max_batch_size`, `max_tokens`. |
+| `fastembed` | A local [fastembed](https://github.com/qdrant/fastembed) ONNX model | Default `BAAI/bge-small-en-v1.5`, the relevance scorer's own model, loaded from its pinned snapshot. Needs `headroom-ai[relevance]`. |
+| `sentence-transformers` | A local sentence-transformers model | Default `HEADROOM_SENTENCE_TRANSFORMER` or `all-MiniLM-L6-v2`. Needs PyTorch. |
+
+Built-in names cannot be taken over by a plugin. If two installed packages
+register the same name, selecting it is an error rather than a coin toss.
+
+## Environment variables
+
+Memory reads the `HEADROOM_EMBEDDER_*` family and relevance scoring reads
+`HEADROOM_RELEVANCE_EMBEDDER_*`, with the same suffixes:
+
+| Suffix | Meaning |
+|--------|---------|
+| `_PROVIDER` | Backend name (`openai`, `fastembed`, `sentence-transformers`, or a plugin's entry-point name). Unset keeps the built-in default. For relevance, `memory` reuses the memory settings. |
+| `_MODEL` | Model id. |
+| `_BASE_URL` | Endpoint for remote backends, including any `/v1` prefix. |
+| `_API_KEY` | Credential for remote backends, independent of the proxy's chat credentials. |
+| `_DIMENSION` | Output width. Required for memory. |
+| `_HEADERS` | Extra request headers as `Name=value` pairs separated by commas. |
+| `_OPTIONS` | A JSON object of further backend options, for example `{"timeout": 10}`. |
+
+`HEADROOM_EMBEDDER_RUNTIME` keeps selecting the device for the built-in memory
+embedder (`cpu`, `pytorch_mps`) and cannot be combined with
+`HEADROOM_EMBEDDER_PROVIDER`, apart from `cpu` and the `openai` alias.
+
+The proxy checks these at startup. An unknown backend name, a malformed value,
+or a backend that fails to construct stops the proxy with a message that names
+the variable, instead of quietly running without the feature.
+
+## One embedding space per database
+
+Vectors from different models cannot be compared, even when their widths
+match. Each memory database records which embedder wrote it (backend, model and
+dimension) the first time it is opened. A later open with a different embedder
+is refused with an `EmbedderMismatchError` that names both. This covers the
+proxy, `headroom memory` commands, the memory MCP server and memory sync, so
+set the same `HEADROOM_EMBEDDER_*` variables everywhere they run, or give each
+embedder its own memory directory. Existing vectors are never migrated or
+re-embedded.
+
+The built-in ONNX and sentence-transformers MiniLM embedders produce the same
+space and share one identity. Set `HEADROOM_EMBEDDER_IDENTITY_CHECK=0`, or
+`LocalBackendConfig(enforce_embedder_identity=False)`, only when you know two
+identities are interchangeable.
+
+## Kompress model backends
+
+A Kompress backend replaces the model and nothing else. It receives text and
+returns shorter text. Headroom keeps doing everything around it, exactly as it
+does for `HEADROOM_KOMPRESS_ENDPOINT`:
+
+- the minimum-size floor;
+- the request's ML time budget;
+- storing originals for [reversible compression](/docs/ccr) and appending the
+  retrieval marker;
+- rejecting results that do not save tokens;
+- passing content through unchanged when the backend fails.
+
+```python
+# my_kompress/backend.py
+class MyCompressor:
+    name = "my-compressor"
+
+    def __init__(self, **options):
+        self._model = load_model(**options)
+
+    def compress_text(
+        self, content: str, *, target_ratio: float | None, question: str | None
+    ) -> str:
+        return self._model.shorten(content, ratio=target_ratio, focus=question)
+```
+
+```toml
+[project.entry-points."headroom.kompress_backend"]
+my-compressor = "my_kompress.backend:MyCompressor"
+```
+
+```bash
+export HEADROOM_KOMPRESS_PROVIDER=my-compressor
+export HEADROOM_KOMPRESS_PROVIDER_OPTIONS='{"device": "cuda"}'   # optional, JSON object
+```
+
+`compress_text` may also return a mapping with the
+[remote endpoint's response fields](/docs/proxy) (`compressed`, plus optional
+token counts). It must be thread-safe and deterministic, because compressed
+blocks are cached and re-sent as a stable prompt prefix. `HEADROOM_KOMPRESS_PROVIDER`
+takes precedence over `HEADROOM_KOMPRESS_ENDPOINT`. Turning Kompress off still
+turns it off. A provider that cannot be loaded disables ML compression and
+logs an error; Headroom does not silently swap in the local model.
+`HEADROOM_KOMPRESS_BACKEND` is unrelated: it picks the inference runtime of the
+built-in model. Health endpoints report a provider as `custom`.
+
+To serve a model from another process or machine instead, implement the HTTP
+contract of `HEADROOM_KOMPRESS_ENDPOINT`. For a compressor that replaces
+Kompress's role for some content types entirely, see the `headroom.compressor`
+registry and `HEADROOM_COMPRESSORS`.
+
+## Air-gapped deployments
+
+With `HEADROOM_OFFLINE=1`, the built-in `openai` backend is refused, even for a
+server on loopback. This is the same rule as every other Headroom-initiated
+connection. The proxy's forwarding of your own requests to the upstream you
+configured is unaffected. The proxy refuses at startup, naming the variable,
+rather than failing on the first request. Use a local backend (`fastembed`,
+`sentence-transformers`, the default ONNX embedder) or a plugin that runs in
+process. A plugin that dials out must call `headroom.offline.guard_egress()`
+itself; Headroom cannot check third-party code. The library API's
+`EmbedderBackend.OLLAMA` memory embedder keeps its existing exemption as an
+operator-configured loopback endpoint.
+
+## Errors and logs
+
+Backend errors name the kind, the backend and, for third-party code, only the
+exception's class. A plugin's own message can contain a URL with a key, or the
+text being embedded, so it is logged only at DEBUG, and in full only with
+`HEADROOM_DEBUG_DUMP=full`. The same applies to error bodies returned by an
+embedding API.
+
+## Not covered
+
+- The Rust proxy and the Rust `SmartCrusher` relevance path use their built-in
+  models. `SmartCrusher(scorer=...)` still raises `NotImplementedError`.
+- The image technique router, OCR, spaCy NER and SigLIP keep their built-in
+  models.
+- Headroom's own LLM calls (`headroom learn`, the mem0 memory backends) are
+  configured through their existing model settings.
