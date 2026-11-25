@@ -8,7 +8,7 @@ Key features:
 - Best of both worlds: exact ID matching + semantic understanding
 - Adaptive alpha: increases BM25 weight for UUID/ID-heavy queries
 - Graceful degradation: falls back to BM25 if embeddings are unavailable,
-  or for any call in which the embedding half fails
+  or for any call in which a configured embedding backend fails
 - Research-backed: Dynamic Alpha Tuning gives +2-7.5% gains (Hsu et al., 2025)
 
 Recommended for production use where accuracy matters.
@@ -53,10 +53,13 @@ class HybridScorer(RelevanceScorer):
         # Semantic query: alpha ~0.5 (balanced)
         score2 = scorer.score(item, "show me the failed requests")
 
-    If fastembed is not installed, falls back to pure BM25. If the embedding
-    scorer raises during a call (a remote backend timing out, a circuit
-    breaker refusing), that call is scored with BM25 alone, exactly as it would
-    be without embeddings; the first such failure is logged at WARNING.
+    If fastembed is not installed, falls back to pure BM25. When the embedding
+    half runs a configured backend (``EmbeddingScorer(backend=...)``) and raises
+    during a call (a remote backend timing out, its circuit breaker refusing),
+    that call is scored with BM25 alone, exactly as it would be without
+    embeddings; the first such failure is logged at WARNING. Any other
+    embedding scorer's failure, the default fastembed one included, reaches
+    the caller as it always has.
     """
 
     # Patterns that indicate exact match is important
@@ -85,7 +88,9 @@ class HybridScorer(RelevanceScorer):
             bm25_scorer: Custom BM25 scorer instance (uses default if None).
             embedding_scorer: Custom embedding scorer (uses default if None),
                 e.g. ``EmbeddingScorer(backend=...)`` or any scorer whose
-                scores are semantic similarities in [0, 1].
+                scores are semantic similarities in [0, 1]. Only an
+                ``EmbeddingScorer`` with a backend gets the per-call BM25
+                fallback.
         """
         self.base_alpha = alpha
         self.adaptive = adaptive
@@ -188,6 +193,17 @@ class HybridScorer(RelevanceScorer):
             matched_terms=result.matched_terms,
         )
 
+    def _falls_back_on_failure(self) -> bool:
+        """Whether a failing embedding call is scored with BM25 instead of raising.
+
+        Only for a configured backend, whose failures (a timeout, an open
+        circuit breaker) are expected and already reported by the scorer. The
+        default fastembed scorer and custom scorers keep raising, as they did
+        before backends existed.
+        """
+        embedding = self.embedding
+        return isinstance(embedding, EmbeddingScorer) and embedding.backend is not None
+
     def _embedding_failed(self, exc: Exception) -> None:
         """Report a failed embedding call: WARNING the first time, DEBUG after.
 
@@ -217,7 +233,8 @@ class HybridScorer(RelevanceScorer):
 
         Returns:
             RelevanceScore with combined score, or the BM25-only score when
-            embeddings are unavailable or fail for this call.
+            embeddings are unavailable or a configured backend fails for this
+            call.
         """
         # Get BM25 score
         bm25_result = self.bm25.score(item, context)
@@ -230,6 +247,8 @@ class HybridScorer(RelevanceScorer):
         try:
             emb_result = self.embedding.score(item, context)
         except Exception as exc:
+            if not self._falls_back_on_failure():
+                raise
             self._embedding_failed(exc)
             return self._boosted(bm25_result)
 
@@ -260,7 +279,7 @@ class HybridScorer(RelevanceScorer):
 
         Returns:
             List of RelevanceScore objects; BM25-only scores when embeddings
-            are unavailable or fail for this call.
+            are unavailable or a configured backend fails for this call.
         """
         if not items:
             return []
@@ -275,6 +294,8 @@ class HybridScorer(RelevanceScorer):
         try:
             emb_results = self.embedding.score_batch(items, context)
         except Exception as exc:
+            if not self._falls_back_on_failure():
+                raise
             self._embedding_failed(exc)
             return [self._boosted(r) for r in bm25_results]
 

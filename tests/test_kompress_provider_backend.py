@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from headroom.log_safety import WarnOnce
-from headroom.models.backends import BackendLoadError, UnknownBackendError
+from headroom.models.backends import BackendError, BackendLoadError, UnknownBackendError
 from headroom.models.backends import registry as registry_module
 from headroom.offline import OfflineEgressBlocked, guard_egress
 from headroom.transforms import kompress_remote
@@ -527,6 +527,82 @@ class TestFailOpen:
         compressor.close()
 
 
+class _PluginError(BackendError):
+    """A plugin's own error class: Headroom's public base, the plugin's message."""
+
+
+_CALL_SECRET = "POST https://api.example.com/v1?key=sk-SECRET-123 failed: 401"
+_FACTORY_SECRET = "could not reach https://u:sk-SECRET-456@host/"
+
+
+class TestPluginErrorsAreNeverLogged:
+    """``BackendError`` is public, so a plugin may raise a subclass of it (or one
+    of Headroom's own classes). Its message is still the plugin's: it is never
+    logged, whatever the class, from ``compress_text`` or from the factory."""
+
+    @pytest.mark.parametrize(
+        "error_class", [_PluginError, BackendLoadError, KompressBackendCallError]
+    )
+    def test_from_compress_text(self, caplog, error_class: type[BackendError]) -> None:
+        caplog.set_level(logging.DEBUG)
+        backend = _Returns(error_class(_CALL_SECRET))
+
+        with pytest.raises(KompressBackendCallError) as excinfo:
+            call_kompress_backend(backend, LONG, target_ratio=None, question=None, label="t")
+        assert "sk-SECRET-123" not in str(excinfo.value)
+        assert error_class.__name__ in str(excinfo.value)
+        assert excinfo.value.__cause__ is backend.value
+
+        compressor = _provider(backend)
+        assert compressor.compress(LONG).compressed == LONG
+        compressor.close()
+
+        loud = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+        assert any("passing through" in line for line in loud), loud
+        assert not [line for line in loud if "sk-SECRET" in line]
+        assert "sk-SECRET" not in caplog.text
+
+    @pytest.mark.parametrize("error_class", [_PluginError, BackendLoadError, UnknownBackendError])
+    def test_from_the_factory(self, monkeypatch, caplog, error_class: type[BackendError]) -> None:
+        def factory(**_options: Any) -> Any:
+            raise error_class(_FACTORY_SECRET)
+
+        register_kompress_backend("leaky", factory)
+        caplog.set_level(logging.DEBUG)
+
+        with pytest.raises(BackendLoadError) as excinfo:
+            create_kompress_backend("leaky")
+        assert type(excinfo.value) is BackendLoadError
+        assert "sk-SECRET-456" not in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, error_class)
+
+        monkeypatch.setenv(KOMPRESS_PROVIDER_ENV, "leaky")
+        assert ContentRouter(ContentRouterConfig())._get_kompress() is None
+
+        loud = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+        assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+        assert not [line for line in loud if "sk-SECRET" in line]
+        assert "sk-SECRET" not in caplog.text
+
+    def test_from_the_factory_at_proxy_startup(self, monkeypatch, caplog, capsys) -> None:
+        from headroom.proxy import server
+        from headroom.proxy.models import ProxyConfig
+
+        def factory(**_options: Any) -> Any:
+            raise _PluginError(_FACTORY_SECRET)
+
+        register_kompress_backend("leaky", factory)
+        monkeypatch.setenv(KOMPRESS_PROVIDER_ENV, "leaky")
+        caplog.set_level(logging.DEBUG)
+
+        with pytest.raises(SystemExit) as excinfo:
+            server._preflight_model_backends(ProxyConfig(optimize=True, memory_enabled=False))
+
+        assert excinfo.value.code == 78
+        assert "sk-SECRET" not in capsys.readouterr().err
+        assert "sk-SECRET" not in caplog.text
+
+
 # =============================================================================
 # CCR: marker, gate and ccr_original, at parity with remote Kompress
 # =============================================================================
@@ -836,6 +912,60 @@ class TestRouterSelection:
         assert len({id(first), id(second), id(third)}) == 3
         assert second.backend.options == {"level": 3}
         assert third.provider == "other"
+
+    def test_concurrent_first_callers_build_one_backend(self, monkeypatch, halver) -> None:
+        """The blocks of one request compress in parallel; each used to build
+        (and all but one to drop, unclosed) its own backend."""
+
+        class SlowLoad(_Halver):
+            name = "slowload"
+
+            def __init__(self, **options: Any) -> None:
+                time.sleep(0.3)  # loading a model
+                super().__init__(**options)
+
+        register_kompress_backend("slowload", SlowLoad)
+        monkeypatch.setenv(KOMPRESS_PROVIDER_ENV, "slowload")
+        router = ContentRouter(ContentRouterConfig())
+        barrier = threading.Barrier(8)
+
+        def first_use(_: int) -> Any:
+            barrier.wait(5)
+            return router._get_kompress()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            got = list(pool.map(first_use, range(8)))
+
+        assert len(halver.instances) == 1, "one construction"
+        assert all(compressor is router._kompress_remote for compressor in got)
+        assert halver.instances[0].closed == 0
+        router._kompress_remote.close()
+
+    def test_a_compressor_the_slot_drops_is_closed(self, monkeypatch, halver) -> None:
+        register_kompress_backend("other", _Halver)
+        monkeypatch.setenv(KOMPRESS_PROVIDER_ENV, "halver")
+        router = ContentRouter(ContentRouterConfig())
+        first = router._get_kompress()
+
+        monkeypatch.setenv(KOMPRESS_PROVIDER_ENV, "other")
+        second = router._get_kompress()
+        assert (first.backend.closed, second.backend.closed) == (1, 0)
+        assert router._get_kompress() is second, "a cache hit closes nothing"
+        assert second.backend.closed == 0
+
+        # Unsetting the provider hands the slot to the endpoint...
+        monkeypatch.delenv(KOMPRESS_PROVIDER_ENV)
+        monkeypatch.setenv(KOMPRESS_ENDPOINT_ENV, "https://kompress.example")
+        remote = router._get_kompress()
+        assert isinstance(remote, RemoteKompressCompressor)
+        assert second.backend.closed == 1
+        assert not remote._client.is_closed
+
+        # ...and a provider that cannot be built empties it.
+        monkeypatch.setenv(KOMPRESS_PROVIDER_ENV, "missing")
+        assert router._get_remote_kompress() is None
+        assert router._kompress_remote is None
+        assert remote._client.is_closed
 
     def test_provider_wins_over_the_endpoint_with_one_warning(
         self, monkeypatch, halver, caplog

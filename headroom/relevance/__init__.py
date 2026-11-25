@@ -102,7 +102,10 @@ def create_scorer(
         embedding_backend: Embed with this instead of fastembed: an
             ``EmbeddingBackend``, a registry spec (``"openai:<model>"``) or a
             function ``fn(list[str]) -> rows``. Needs tier "embedding" or
-            "hybrid", and no fastembed.
+            "hybrid", and no fastembed. A spec naming the built-in ``openai``
+            backend gets the request-path bounds (a 5 s timeout, no retries),
+            as ``RelevanceScorerConfig.embedding_backend`` does; pass an
+            instance to choose others.
         **kwargs: Additional arguments passed to scorer constructor.
 
     Returns:

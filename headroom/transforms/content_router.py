@@ -67,7 +67,7 @@ from ..config import (
     is_tool_excluded,
     unwrap_tool_call,
 )
-from ..log_safety import content_logging_enabled
+from ..log_safety import content_logging_enabled, describe_exception
 from ..offline import OfflineEgressBlocked
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
@@ -2685,6 +2685,34 @@ class _PerRequestRuntimeState:
 # ContextVar (names only matter for repr/debugging; uniqueness avoids any
 # confusion when introspecting multiple router instances in one process).
 _runtime_state_var_ids = itertools.count()
+
+
+def _remote_kompress_lock(router: Any) -> threading.Lock:
+    """The lock that serialises building ``router``'s remote Kompress slot.
+
+    Created on first use, not in ``__init__``: routers built with
+    ``object.__new__`` and the stubs the offline tests drive have no
+    ``__init__`` state. ``setdefault`` makes concurrent first callers share one.
+    """
+    lock: threading.Lock | None = getattr(router, "_kompress_remote_lock", None)
+    if lock is None:
+        lock = router.__dict__.setdefault("_kompress_remote_lock", threading.Lock())
+    return lock
+
+
+def _close_replaced_kompress(compressor: Any) -> None:
+    """Close a compressor the remote Kompress slot dropped. Never raises.
+
+    A call already running on it was handed out before the swap; at worst it
+    fails open and passes its block through.
+    """
+    closer = getattr(compressor, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception as exc:  # noqa: BLE001 - closing must not fail the request
+        logger.debug("Closing a replaced Kompress compressor failed: %s", describe_exception(exc))
 
 
 class ContentRouter(Transform):
@@ -5643,7 +5671,7 @@ class ContentRouter(Transform):
         it is a BaseException; an uncaught one would reach
         ``threading.excepthook`` as a bare traceback.
         """
-        from ..log_safety import describe_class, describe_exception
+        from ..log_safety import describe_class
         from ..offline import note_refusal
 
         spec = self.config.relevance.embedding_backend
@@ -5663,12 +5691,8 @@ class ContentRouter(Transform):
             if backend is None:
                 scorer = create_scorer(tier)
                 # Force the model download+load and a first embed here, in the
-                # background — so the first real request finds it warm. The
-                # embedding half is warmed itself: the hybrid scorer would fall
-                # back to BM25 on its failure, and swap in a scorer whose model
-                # never loads.
-                warm = getattr(scorer, "embedding", None) or scorer
-                warm.score_batch(["warmup"], "warmup")
+                # background — so the first real request finds it warm.
+                scorer.score_batch(["warmup"], "warmup")
             else:
                 from ..models.backends.embedding import _backend_label
 
@@ -5752,7 +5776,9 @@ class ContentRouter(Transform):
                 max_records=self._relevance_max_records(),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("relevance split failed (%s); falling back", exc)
+            # Never the message: an embedding backend's can quote its endpoint,
+            # a key or the scored content.
+            logger.debug("relevance split failed (%s); falling back", describe_exception(exc))
             return None
 
         # No low-relevance tail → plain compaction is already optimal here.
@@ -5767,7 +5793,7 @@ class ContentRouter(Transform):
             try:
                 compressed, _ = self._try_ml_compressor(text, query)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("kompress tail failed (%s); keeping verbatim", exc)
+                logger.debug("kompress tail failed (%s); keeping verbatim", describe_exception(exc))
                 compressed = compact_lossless(text, kind)
             out_parts.append(compressed)
 
@@ -6104,16 +6130,34 @@ class ContentRouter(Transform):
         are cached per ContentRouter instance in ``_kompress_remote`` (where
         the proxy's health check finds them) so the backend, worker pool and
         httpx connection pool are reused across requests.
+
+        Building is serialised per router: the blocks of one request compress
+        in parallel, and without the lock each concurrent first caller would
+        build (and all but one would leak) its own backend. A compressor the
+        slot no longer holds is closed.
         """
         if os.environ.get("HEADROOM_KOMPRESS_PROVIDER", "").strip():
-            from .kompress_remote import provider_kompress_from_env
-
-            # Typed Any like the slot itself: it holds either compressor class.
-            provider: Any = provider_kompress_from_env(
-                getattr(self, "_kompress_remote", None),
-                enable_ccr=self.config.ccr_inject_marker,
+            from .kompress_remote import (
+                ProviderKompressCompressor,
+                provider_kompress_from_env,
+                provider_selection_key,
             )
-            self._kompress_remote = provider
+
+            current = getattr(self, "_kompress_remote", None)
+            if (
+                isinstance(current, ProviderKompressCompressor)
+                and current.selection_key == provider_selection_key()
+            ):
+                return current
+            with _remote_kompress_lock(self):
+                current = getattr(self, "_kompress_remote", None)
+                # Typed Any like the slot itself: it holds either compressor class.
+                provider: Any = provider_kompress_from_env(
+                    current, enable_ccr=self.config.ccr_inject_marker
+                )
+                self._kompress_remote = provider
+            if current is not None and provider is not current:
+                _close_replaced_kompress(current)
             return provider
         endpoint = os.environ.get("HEADROOM_KOMPRESS_ENDPOINT", "").strip()
         if not endpoint:
@@ -6123,7 +6167,12 @@ class ContentRouter(Transform):
         # A provider compressor left in the slot after HEADROOM_KOMPRESS_PROVIDER
         # was unset is replaced, never served as the endpoint.
         current = getattr(self, "_kompress_remote", None)
-        if current is None or isinstance(current, ProviderKompressCompressor):
+        if current is not None and not isinstance(current, ProviderKompressCompressor):
+            return current
+        with _remote_kompress_lock(self):
+            current = getattr(self, "_kompress_remote", None)
+            if current is not None and not isinstance(current, ProviderKompressCompressor):
+                return current
             from .kompress_compressor import KompressConfig
             from .kompress_remote import (
                 DEFAULT_ENDPOINT_PATH,
@@ -6135,7 +6184,7 @@ class ContentRouter(Transform):
             # (Modal) deployments are unaffected: os.environ.get with a default
             # distinguishes "unset" (use /compress) from an explicit empty value
             # (the operator's endpoint is already a complete URL).
-            self._kompress_remote = RemoteKompressCompressor(
+            remote = RemoteKompressCompressor(
                 endpoint=endpoint,
                 token=os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_TOKEN") or None,
                 config=KompressConfig(enable_ccr=self.config.ccr_inject_marker),
@@ -6144,8 +6193,11 @@ class ContentRouter(Transform):
                     os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_HEADERS")
                 ),
             )
-            logger.info("Kompress: using remote endpoint %s", self._kompress_remote.url)
-        return self._kompress_remote
+            self._kompress_remote = remote
+            logger.info("Kompress: using remote endpoint %s", remote.url)
+        if current is not None:
+            _close_replaced_kompress(current)
+        return remote
 
     def _get_image_optimizer(self) -> Any:
         """Create an ImageCompressor for one optimization pass.

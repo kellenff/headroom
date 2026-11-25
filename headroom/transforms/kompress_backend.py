@@ -59,9 +59,9 @@ Obligations a backend must meet:
 * Air-gap compliance. A backend that opens network connections must call
   :func:`headroom.offline.guard_egress` in its constructor and before each
   request. Headroom cannot enforce it for third-party code.
-* Safe errors. Headroom logs only the class of an exception a backend raises,
-  never its message, so a message may not be the only place a failure is
-  explained.
+* Safe errors. Headroom logs only the class of an exception a backend or its
+  factory raises, never its message (a :class:`BackendError` subclass
+  included), so a message may not be the only place a failure is explained.
 
 Headroom may construct a backend more than once (one per compression pipeline).
 A backend that loads a large model in-process should share it between
@@ -122,6 +122,7 @@ from ..log_safety import describe_class, describe_exception
 from ..models.backends.registry import (
     NAME_RE,
     BackendError,
+    BackendLoadError,
     BackendRegistry,
     UnknownBackendError,
 )
@@ -143,8 +144,9 @@ class KompressBackendCallError(BackendError):
     """A backend's ``compress_text`` raised.
 
     The message names only the backend and the exception class; the original
-    is chained. Errors that are already :class:`BackendError` subclasses pass
-    through unchanged.
+    is chained. Every exception is wrapped, :class:`BackendError` subclasses
+    included: a Kompress backend is always third-party code, so its message
+    is never Headroom's to repeat.
     """
 
 
@@ -204,12 +206,23 @@ def available_kompress_backends() -> list[str]:
 def create_kompress_backend(name: str, /, **options: Any) -> KompressModelBackend:
     """Construct the Kompress backend registered under ``name`` with ``options``.
 
+    Every exception the factory raises becomes a :class:`BackendLoadError`
+    that names only its class, :class:`BackendError` subclasses included:
+    there are no built-ins, so a factory is always third-party code.
+
     Raises:
         UnknownBackendError: No backend has that name.
         BackendLoadError: The factory failed to import or construct.
         TypeError: The factory returned something that is not a Kompress backend.
     """
-    backend = KOMPRESS_BACKENDS.create(name, **options)
+    factory = KOMPRESS_BACKENDS.get_factory(name)
+    try:
+        backend = factory(**options)
+    except Exception as exc:
+        logger.debug("Kompress backend %r failed to initialise: %s", name, describe_exception(exc))
+        raise BackendLoadError(
+            f"kompress backend {name!r} failed to initialise ({describe_class(type(exc))})"
+        ) from exc
     if not isinstance(backend, KompressModelBackend):
         raise TypeError(
             f"Kompress backend {name!r} returned {describe_class(type(backend))}, which does "
@@ -324,9 +337,7 @@ def call_kompress_backend(
     """
     try:
         raw = backend.compress_text(content, target_ratio=target_ratio, question=question)
-    except BackendError:
-        raise
-    except Exception as exc:
+    except Exception as exc:  # BackendError too: its message is the plugin's, not ours
         logger.debug("Kompress backend %r failed: %s", label, describe_exception(exc))
         raise KompressBackendCallError(
             f"Kompress backend {label!r} failed ({describe_class(type(exc))})"

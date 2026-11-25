@@ -23,6 +23,7 @@ import headroom.transforms.content_router as content_router_module
 from headroom.config import RelevanceScorerConfig
 from headroom.models.backends import (
     EMBEDDING_BACKENDS,
+    BackendError,
     CallableEmbeddingBackend,
     register_embedding_backend,
 )
@@ -200,9 +201,8 @@ class TestDefaultFastembedPrewarm:
     def test_a_model_that_fails_to_load_leaves_bm25_in_place(
         self, fastembed_stub: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The hybrid scorer now absorbs embedding failures, so warming through
-        it would hide this one and swap in a scorer whose model never loads,
-        retrying the load on every request. The embedding half is warmed itself."""
+        """The default hybrid scorer's embedding failure reaches the prewarm,
+        so a scorer whose model never loads is not swapped in."""
         loads: list[int] = []
 
         def broken_load() -> Any:
@@ -234,6 +234,87 @@ class TestDefaultFastembedPrewarm:
         assert isinstance(scorer, HybridScorer) and scorer.has_embedding_support()
         assert _backend_of(scorer) is None
         assert router._relevance_max_records() == 0
+
+    def test_a_fastembed_call_failing_after_warm_up_skips_the_split(
+        self, fastembed_stub: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing configured: a failing fastembed call makes the split fall back
+        to the normal path, as before backends existed, rather than cutting the
+        output by BM25 scores alone."""
+        calls: list[int] = []
+
+        class Model:
+            def embed(self, texts: list[str], **_kw: Any) -> Iterator[list[float]]:
+                calls.append(len(texts))
+                if len(calls) > 1:
+                    raise RuntimeError("ORT run failed")
+                yield from _keyword_vectors(texts)
+
+        monkeypatch.setattr(embedding, "_load_default_model", Model)
+        router = ContentRouter(ContentRouterConfig())
+        router._prewarm_relevance_scorer("hybrid")
+        assert isinstance(router._relevance_scorer, HybridScorer)
+        router._relevance_scorer_tried = True
+        router._try_ml_compressor = lambda *_args, **_kwargs: ("[TAIL]", 1)  # type: ignore[method-assign]
+
+        lines = [f"2024-01-01 INFO worker {i} heartbeat ok" for i in range(300)]
+        lines[150] = "2024-01-01 ERROR disk full on /dev/sda1 write failed"
+        out = router._relevance_split_compress(
+            "\n".join(lines), "log", "why did the disk write fail"
+        )
+
+        assert out is None
+        assert len(calls) == 2
+
+
+class TestSplitFailureLogging:
+    """A failure inside the split is logged at DEBUG by class and location only."""
+
+    def test_a_plugin_backend_errors_message_is_not_logged(
+        self, fake: _FakeBackends, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class PluginError(BackendError):
+            pass
+
+        caplog.set_level(logging.DEBUG)
+        router = ContentRouter(
+            ContentRouterConfig(
+                relevance=RelevanceScorerConfig(tier="embedding", embedding_backend="fake-rel:m")
+            )
+        )
+        router._prewarm_relevance_scorer("embedding")
+        assert _backend_of(router._relevance_scorer) is not None
+        router._relevance_scorer_tried = True
+        # embed_texts passes a BackendError subclass through, message and all.
+        fake.fail_embed = PluginError("POST https://u:sk-SECRET123@emb.example/v1 failed")
+
+        records = "".join(f"record {i} widget status ok\n\n" for i in range(20))
+        assert router._relevance_split_compress(records, "log", "timeout errors") is None
+
+        assert len(fake.batches) == 2
+        assert "sk-SECRET123" not in caplog.text
+        lines = [r.getMessage() for r in caplog.records if r.name == ROUTER_LOGGER]
+        assert any("relevance split failed (" in line and "PluginError" in line for line in lines)
+
+    def test_a_failing_tail_compressor_is_logged_without_its_message(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger=ROUTER_LOGGER)
+        router = ContentRouter(ContentRouterConfig())
+        router._relevance_scorer = BM25Scorer()
+        router._relevance_scorer_tried = True
+
+        def failing_tail(*_args: Any, **_kwargs: Any) -> tuple[str, int]:
+            raise RuntimeError("tail model said sk-TAIL-SECRET")
+
+        router._try_ml_compressor = failing_tail  # type: ignore[method-assign]
+        lines = [f"2024-01-01 INFO worker {i} heartbeat ok" for i in range(300)]
+        lines[150] = "2024-01-01 ERROR disk full on /dev/sda1 write failed"
+        router._relevance_split_compress("\n".join(lines), "log", "why did the disk write fail")
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("kompress tail failed (" in m and "RuntimeError" in m for m in messages)
+        assert "sk-TAIL-SECRET" not in caplog.text
 
 
 class TestPrewarmFailures:

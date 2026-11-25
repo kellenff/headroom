@@ -541,26 +541,79 @@ class TestHybridFallback:
     ITEMS = ['{"id": 1, "user": "alice"}', '{"id": 2, "user": "bob"}', "unrelated log line"]
     QUERY = "find user alice"
 
-    def test_a_failing_embedding_call_gets_the_no_embedding_result(
-        self, caplog: pytest.LogCaptureFixture
+    def test_a_failing_backend_call_gets_the_no_embedding_result(
+        self, caplog: pytest.LogCaptureFixture, clock: list[float]
     ) -> None:
-        caplog.set_level(logging.DEBUG, logger="headroom.relevance.hybrid")
-        failing = _FailingEmbeddingScorer(RuntimeError("upstream said sk-secret"))
-        hybrid = HybridScorer(bm25_scorer=BM25Scorer(), embedding_scorer=failing)
+        caplog.set_level(logging.DEBUG, logger="headroom.relevance")
+        fn = _Recorder()
+        fn.fail_with = RuntimeError("upstream said sk-secret")
+        hybrid = HybridScorer(
+            bm25_scorer=BM25Scorer(), embedding_scorer=EmbeddingScorer(backend=fn)
+        )
         expected = _bm25_only_hybrid()
 
         assert hybrid.score_batch(self.ITEMS, self.QUERY) == expected.score_batch(
             self.ITEMS, self.QUERY
         )
+        # The breaker is open now: these fail without calling the backend.
         assert hybrid.score(self.ITEMS[0], self.QUERY) == expected.score(self.ITEMS[0], self.QUERY)
         hybrid.score_batch(self.ITEMS, self.QUERY)
 
-        assert failing.calls == 3
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(fn.calls) == 1
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == "headroom.relevance.hybrid"
+        ]
         assert len(warnings) == 1, "warned once, not per call"
-        assert "RuntimeError" in warnings[0].getMessage()
+        assert "EmbeddingBackendCallError" in warnings[0].getMessage()
         assert "sk-secret" not in caplog.text
         assert hybrid.has_embedding_support() is True
+
+    def test_a_custom_embedding_scorers_failure_still_reaches_the_caller(self) -> None:
+        failing = _FailingEmbeddingScorer(RuntimeError("custom scorer failed"))
+        hybrid = HybridScorer(bm25_scorer=BM25Scorer(), embedding_scorer=failing)
+        with pytest.raises(RuntimeError, match="custom scorer failed"):
+            hybrid.score_batch(self.ITEMS, self.QUERY)
+        with pytest.raises(RuntimeError, match="custom scorer failed"):
+            hybrid.score(self.ITEMS[0], self.QUERY)
+        assert failing.calls == 2
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("model download failed"),
+            OfflineEgressBlocked("fastembed weight download", "huggingface.co"),
+        ],
+        ids=["load-error", "air-gap"],
+    )
+    def test_the_default_fastembed_scorers_failure_still_reaches_the_caller(
+        self,
+        fastembed_installed: None,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        failure: BaseException,
+    ) -> None:
+        """Nothing configured: the default scorer raises exactly as before backends existed."""
+        caplog.set_level(logging.WARNING, logger="headroom.relevance")
+        loads: list[str] = []
+
+        def failing_load(model_name: str) -> Any:
+            loads.append(model_name)
+            raise failure
+
+        monkeypatch.setattr(embedding, "_load_fastembed_model", failing_load)
+        hybrid = create_scorer("hybrid")
+        assert isinstance(hybrid, HybridScorer)
+        assert isinstance(hybrid.embedding, EmbeddingScorer)
+        assert hybrid.embedding.backend is None
+
+        with pytest.raises(RuntimeError):
+            hybrid.score_batch(self.ITEMS, self.QUERY)
+        with pytest.raises(RuntimeError):
+            hybrid.score(self.ITEMS[0], self.QUERY)
+        assert len(loads) == 2
+        assert not caplog.records, "a propagated failure is the caller's to report"
 
     def test_an_air_gap_refusal_is_not_degraded(self) -> None:
         failing = _FailingEmbeddingScorer(OfflineEgressBlocked("relevance", "api.example.com"))
@@ -791,7 +844,31 @@ class TestResolveRelevanceEmbeddingBackend:
 
         register_embedding_backend("openai", factory, replace=True)
         resolve_relevance_embedding_backend("openai:m")
-        assert built == [{"model": "m"}]
+        EmbeddingScorer(backend="openai:m")
+        create_scorer("hybrid", embedding_backend="openai:m")
+        assert built == [{"model": "m"}] * 3
+
+    def test_a_spec_gets_the_same_bounds_through_every_entry_point(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(OFFLINE_ENV, raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-placeholder")
+        spec = "openai:m"
+        hybrid: Any = create_scorer("hybrid", embedding_backend=spec)
+        embedding_tier: Any = create_scorer("embedding", embedding_backend=spec)
+        backends: list[Any] = [
+            resolve_relevance_embedding_backend(spec),
+            EmbeddingScorer(backend=spec).backend,
+            embedding_tier.backend,
+            hybrid.embedding.backend,
+        ]
+        assert [(b.timeout, b.max_retries) for b in backends] == [
+            (RELEVANCE_OPENAI_TIMEOUT_SECONDS, RELEVANCE_OPENAI_MAX_RETRIES)
+        ] * 4
+
+        # An instance is the caller's choice and is used as given.
+        instance = create_embedding_backend(spec)
+        assert EmbeddingScorer(backend=instance).backend is instance
 
     def test_an_air_gapped_process_refuses_a_remote_backend(
         self, monkeypatch: pytest.MonkeyPatch

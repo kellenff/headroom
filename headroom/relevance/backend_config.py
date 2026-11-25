@@ -17,6 +17,10 @@ The built-in ``openai`` backend is built here with request-path defaults, a
 5 s timeout and no retries, unless the settings set either. Relevance runs
 inside compression on the request thread, where the backend's own defaults (a
 30 s timeout, two retries) could stall one request for well over a minute.
+Spec strings given to ``create_scorer(embedding_backend=...)`` and
+``EmbeddingScorer(backend=...)`` are built by
+:func:`create_relevance_embedding_backend` too, so a spec gets the same bounds
+whichever entry point it came through.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ __all__ = [
     "RELEVANCE_BACKEND_MAX_RECORDS",
     "RELEVANCE_OPENAI_MAX_RETRIES",
     "RELEVANCE_OPENAI_TIMEOUT_SECONDS",
+    "create_relevance_embedding_backend",
     "describe_relevance_embedding_backend",
     "resolve_relevance_embedding_backend",
     "validate_relevance_embedding_backend_value",
@@ -122,6 +127,27 @@ def _request_path_options(name: str, options: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+def create_relevance_embedding_backend(spec: str) -> EmbeddingBackend:
+    """Construct the backend a ``"name"`` or ``"name:model"`` spec names, for relevance.
+
+    :func:`~headroom.models.backends.create_embedding_backend` with the
+    request-path defaults applied: the built-in ``openai`` backend gets a 5 s
+    timeout and no retries. Every relevance entry point that takes a spec
+    string builds it here. To choose other bounds, construct the backend
+    yourself and pass the instance.
+
+    Raises:
+        ValueError: ``spec`` is malformed (``UnknownBackendError`` is one: no
+            backend has that name).
+        BackendLoadError: The backend failed to import or construct.
+        TypeError: The factory returned something that is not an embedding backend.
+        OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and the backend dials
+            out (a ``BaseException``; catch it explicitly).
+    """
+    name, _model = parse_backend_spec(spec)
+    return create_embedding_backend(spec, **_request_path_options(name, {}))
+
+
 def resolve_relevance_embedding_backend(
     value: str | None, env: Mapping[str, str] | None = None
 ) -> EmbeddingBackend | None:
@@ -155,5 +181,4 @@ def resolve_relevance_embedding_backend(
         settings.validate()
         options = _request_path_options(settings.name, settings.backend_options())
         return create_embedding_backend(settings.name, **options)
-    name, _model = parse_backend_spec(value)
-    return create_embedding_backend(value, **_request_path_options(name, {}))
+    return create_relevance_embedding_backend(value)

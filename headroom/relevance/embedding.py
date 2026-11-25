@@ -60,6 +60,7 @@ from headroom.models.backends.embedding import _backend_label, _positive_int_or_
 from headroom.offline import OfflineEgressBlocked, guard_egress
 from headroom.onnx_runtime import _resolve_revision, hf_hub_download_local_first
 
+from .backend_config import create_relevance_embedding_backend
 from .base import RelevanceScore, RelevanceScorer
 
 # Texts per ONNX Runtime run. fastembed pads each batch to its longest text, and
@@ -460,7 +461,10 @@ class EmbeddingScorer(RelevanceScorer):
             backend: Embed with this instead of fastembed: an
                 ``EmbeddingBackend``, a registry spec (``"name"`` or
                 ``"name:model"``) or a function ``fn(list[str]) -> rows``.
-                A spec is constructed here, so a bad one fails now.
+                A spec is constructed here, so a bad one fails now. A spec
+                naming the built-in ``openai`` backend gets the request-path
+                bounds (a 5 s timeout, no retries); pass an instance to
+                choose others.
             backend_cooldown_seconds: How long a failed backend is left
                 alone before one call retries it.
 
@@ -482,7 +486,12 @@ class EmbeddingScorer(RelevanceScorer):
                 "'name:model'"
             )
         self._breaker = _CircuitBreaker(_cooldown_seconds(backend_cooldown_seconds))
-        self._backend = as_embedding_backend(backend)
+        # A spec gets the request-path bounds RelevanceScorerConfig's specs get.
+        self._backend = (
+            create_relevance_embedding_backend(backend)
+            if isinstance(backend, str)
+            else as_embedding_backend(backend)
+        )
         self._backend_label = _backend_label(self._backend)
         self.model_name = self._backend.model_name
 
