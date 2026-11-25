@@ -85,6 +85,7 @@ async def test_a_configuration_error_is_reported_once_and_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("HEADROOM_EMBEDDER_PROVIDER", "openai")  # no DIMENSION
+    monkeypatch.setenv("HEADROOM_EMBEDDER_API_KEY", "test-key")
     handler = _handler(tmp_path)
     calls = _count_inits(monkeypatch, handler)
 

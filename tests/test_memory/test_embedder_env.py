@@ -78,8 +78,13 @@ def test_runtime_openai_is_the_same_selection() -> None:
 
 
 def test_the_model_is_optional() -> None:
-    env = {"HEADROOM_EMBEDDER_PROVIDER": "openai", "HEADROOM_EMBEDDER_DIMENSION": "1536"}
-    assert local_backend_embedder_kwargs_from_env(env)["embedder_options"] == {}
+    env = {
+        "HEADROOM_EMBEDDER_PROVIDER": "openai",
+        "HEADROOM_EMBEDDER_DIMENSION": "1536",
+        "HEADROOM_EMBEDDER_API_KEY": "test-key",
+    }
+    options = local_backend_embedder_kwargs_from_env(env)["embedder_options"]
+    assert "model" not in options
 
 
 @pytest.mark.parametrize(
@@ -87,8 +92,9 @@ def test_the_model_is_optional() -> None:
     [{"HEADROOM_EMBEDDER_PROVIDER": "openai"}, {"HEADROOM_EMBEDDER_RUNTIME": "openai"}],
 )
 def test_memory_requires_the_dimension(selector: dict[str, str]) -> None:
+    env = {**selector, "HEADROOM_EMBEDDER_API_KEY": "test-key"}
     with pytest.raises(ValueError, match="HEADROOM_EMBEDDER_DIMENSION is required"):
-        local_backend_embedder_kwargs_from_env(selector)
+        local_backend_embedder_kwargs_from_env(env)
 
 
 @pytest.mark.parametrize(

@@ -72,6 +72,7 @@ def test_sync_uses_the_proxy_embedder(tmp_path: Path, monkeypatch: pytest.Monkey
 
 def test_sync_refuses_invalid_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_EMBEDDER_PROVIDER", "openai")
+    monkeypatch.setenv("HEADROOM_EMBEDDER_API_KEY", "test-key")
     with pytest.raises(ValueError, match="HEADROOM_EMBEDDER_DIMENSION"):
         _build_sync_backend(str(tmp_path / "memory.db"))
 

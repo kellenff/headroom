@@ -553,6 +553,7 @@ def test_the_proxy_embedder_settings_are_honoured(monkeypatch) -> None:
 def test_invalid_embedder_settings_return_an_error_result(monkeypatch) -> None:
     _clear_embedder_env(monkeypatch)
     monkeypatch.setenv("HEADROOM_EMBEDDER_PROVIDER", "openai")  # no DIMENSION
+    monkeypatch.setenv("HEADROOM_EMBEDDER_API_KEY", "test-key")
     configs = _capture_backend_configs(monkeypatch, SimpleNamespace(close=AsyncMock()))
 
     server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")

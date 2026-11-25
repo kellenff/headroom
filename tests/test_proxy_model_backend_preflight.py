@@ -185,9 +185,11 @@ def test_memory_runtime_alias_is_checked_too(
 ) -> None:
     monkeypatch.setenv("HEADROOM_EMBEDDER_RUNTIME", "openai")
     monkeypatch.setenv("HEADROOM_EMBEDDER_DIMENSION", "8")
-    # api.openai.com without a key.
+    # api.openai.com without HEADROOM_EMBEDDER_API_KEY; the chat key is not used.
+    monkeypatch.setenv("OPENAI_API_KEY", SECRET)
     message = _refused(_config(), capsys)
-    assert "api_key is required" in message
+    assert "HEADROOM_EMBEDDER_API_KEY is required" in message
+    assert SECRET not in message
 
 
 def test_memory_selection_is_ignored_when_memory_is_off(monkeypatch: pytest.MonkeyPatch) -> None:

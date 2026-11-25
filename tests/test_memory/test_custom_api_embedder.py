@@ -221,6 +221,7 @@ async def test_proxy_custom_api_key_is_optional_off_openai(embedding_api, tmp_pa
 @pytest.mark.parametrize("dimension", ["0", "-1", "invalid", ""])
 async def test_proxy_rejects_invalid_api_dimension(tmp_path, monkeypatch, dimension):
     monkeypatch.setenv("HEADROOM_EMBEDDER_RUNTIME", "openai")
+    monkeypatch.setenv("HEADROOM_EMBEDDER_API_KEY", "test-key")
     monkeypatch.setenv("HEADROOM_EMBEDDER_DIMENSION", dimension)
     handler = MemoryHandler(ProxyMemoryConfig(enabled=True, db_path=str(tmp_path / "memory.db")))
     with pytest.raises(ValueError, match="HEADROOM_EMBEDDER_DIMENSION"):
@@ -256,8 +257,9 @@ def test_custom_api_rejects_invalid_connection_settings(settings):
     [
         # Any server other than OpenAI's needs the model named.
         ("HEADROOM_EMBEDDER_MODEL", "http://embedding.invalid/v1", "model is required"),
-        # OpenAI's own endpoint needs a key (HEADROOM_EMBEDDER_API_KEY or OPENAI_API_KEY).
-        ("HEADROOM_EMBEDDER_API_KEY", None, "api_key is required"),
+        # OpenAI's own endpoint needs HEADROOM_EMBEDDER_API_KEY; the chat
+        # credential (OPENAI_API_KEY) is never used for embeddings.
+        ("HEADROOM_EMBEDDER_API_KEY", None, "HEADROOM_EMBEDDER_API_KEY is required"),
     ],
 )
 async def test_proxy_missing_api_settings_never_falls_back(
@@ -280,7 +282,9 @@ async def test_proxy_missing_api_settings_never_falls_back(
     _reset_embedder_cache_for_tests()
     handler = MemoryHandler(ProxyMemoryConfig(enabled=True, db_path=str(tmp_path / "memory.db")))
     try:
-        with pytest.raises(BackendError, match=error):
+        # A malformed variable is a ValueError; a backend that will not
+        # construct is a BackendError. Either way nothing falls back.
+        with pytest.raises((BackendError, ValueError), match=error):
             await handler._init_backend_locked()
         # The embedder is built before the store, so nothing was created.
         assert not (tmp_path / "memory.db").exists()
