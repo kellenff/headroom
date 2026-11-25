@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import threading
 import time
 from typing import Any
@@ -48,10 +49,24 @@ _OPENAI_HOST = "api.openai.com"
 _PURPOSE = "OpenAI-compatible embedding API"
 _RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _MAX_BACKOFF_SECONDS = 8.0
+# What httpx and h11 accept when the request is sent: a header name is an
+# RFC 7230 token; a value is ASCII (httpx encodes str values as ASCII), without
+# control characters or leading or trailing whitespace.
+_HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_HEADER_VALUE_RE = re.compile(r"(?:[\x21-\x7e](?:[\t\x20-\x7e]*[\x21-\x7e])?)?")
+_BASE_URL_RULE = (
+    "base_url must be an http(s) URL with a host, a valid port and no credentials, "
+    "query or fragment"
+)
 
 
 def _validate_base_url(base_url: str) -> str:
-    parts = urlsplit(base_url)
+    try:
+        parts = urlsplit(base_url)
+        _ = parts.port  # raises ValueError on a non-numeric or out-of-range port
+        httpx.URL(base_url)
+    except (ValueError, httpx.InvalidURL):
+        raise ValueError(_BASE_URL_RULE) from None
     if (
         parts.scheme not in {"http", "https"}
         or not parts.hostname
@@ -60,21 +75,39 @@ def _validate_base_url(base_url: str) -> str:
         or parts.query
         or parts.fragment
     ):
-        raise ValueError(
-            "base_url must be an http(s) URL with a host and no credentials, query or fragment"
-        )
+        raise ValueError(_BASE_URL_RULE)
     return base_url.rstrip("/")
 
 
 def _validate_headers(headers: dict[str, str] | None) -> dict[str, str]:
     out: dict[str, str] = {}
+    seen: set[str] = set()
     for key, value in (headers or {}).items():
         if not isinstance(key, str) or not isinstance(value, str):
             raise ValueError("headers must map strings to strings")
-        if any(ch in key + value for ch in "\r\n\x00"):
-            raise ValueError("header names and values must not contain control characters")
+        if not _HEADER_NAME_RE.fullmatch(key):
+            raise ValueError(
+                "headers: each name must be an HTTP token (ASCII letters, digits and "
+                "!#$%&'*+-.^_`|~)"
+            )
+        if not _HEADER_VALUE_RE.fullmatch(value):
+            raise ValueError(
+                "headers: each value must be printable ASCII without control characters "
+                "or leading or trailing whitespace"
+            )
+        if key.lower() in seen:
+            raise ValueError("headers must not repeat a name; header names are case-insensitive")
+        seen.add(key.lower())
         out[key] = value
     return out
+
+
+def _merge_headers(defaults: dict[str, str], custom: dict[str, str]) -> dict[str, str]:
+    """``defaults`` overridden by ``custom``, matching header names case-insensitively."""
+    overridden = {key.lower() for key in custom}
+    merged = {key: value for key, value in defaults.items() if key.lower() not in overridden}
+    merged.update(custom)
+    return merged
 
 
 class OpenAICompatibleEmbeddingBackend:
@@ -94,13 +127,20 @@ class OpenAICompatibleEmbeddingBackend:
         request_dimensions: Also send ``"dimensions": dimension`` in the request,
             asking models that support it (OpenAI ``text-embedding-3-*``) to
             shorten their output. Off by default.
-        headers: Extra request headers, applied after ``Authorization``.
+        headers: Extra request headers. A header with the same name as
+            ``Authorization`` or ``Content-Type``, in any case, replaces it.
+            Names must be HTTP tokens and values printable ASCII.
         timeout: Per-request timeout in seconds.
         max_retries: Retries after the first attempt, for connection errors,
             timeouts, 429 and 5xx responses.
         max_batch_size: Most texts sent in one request.
-        max_tokens: The model's input window, reported to consumers that trim
-            queries (memory). Defaults to 8191, OpenAI's limit.
+        max_tokens: The model's input window, exposed as the ``max_tokens``
+            attribute. Headroom does not trim inputs to it; callers keep
+            texts within the window. Defaults to 8191, OpenAI's limit.
+
+    Raises:
+        ValueError: An option is malformed. The message names the option,
+            never its value.
     """
 
     name = "openai"
@@ -138,6 +178,8 @@ class OpenAICompatibleEmbeddingBackend:
         self._api_key = api_key.strip() if api_key and api_key.strip() else None
         if is_openai and self._api_key is None:
             raise ValueError("api_key is required for api.openai.com (or set OPENAI_API_KEY)")
+        if self._api_key is not None and not _HEADER_VALUE_RE.fullmatch(self._api_key):
+            raise ValueError("api_key must be printable ASCII")
 
         self.dimension = _positive_int_or_none(dimension, "dimension")
         if request_dimensions and self.dimension is None:
@@ -168,13 +210,12 @@ class OpenAICompatibleEmbeddingBackend:
         with self._lock:
             if self._client is None:
                 guard_egress(_PURPOSE, self.host)
-                request_headers = {"Content-Type": "application/json"}
+                defaults = {"Content-Type": "application/json"}
                 if self._api_key:
-                    request_headers["Authorization"] = f"Bearer {self._api_key}"
-                request_headers.update(self._headers)
+                    defaults["Authorization"] = f"Bearer {self._api_key}"
                 self._client = httpx.Client(
                     base_url=self.base_url,
-                    headers=request_headers,
+                    headers=_merge_headers(defaults, self._headers),
                     timeout=self.timeout,
                 )
             return self._client

@@ -40,6 +40,8 @@ Obligations a backend must meet:
   idempotent and a later ``embed`` must work (re-open lazily).
 * Safe errors. Headroom logs only the class of an exception raised by a
   third-party backend, not its message, unless ``HEADROOM_DEBUG_DUMP=full``.
+  This includes a :class:`~headroom.models.backends.BackendError` subclass:
+  only Headroom's built-in backends have their messages kept.
 
 Factories
 ---------
@@ -93,10 +95,12 @@ class EmbeddingBackendResponseError(BackendError, ValueError):
 class EmbeddingBackendCallError(BackendError):
     """A backend's ``embed`` raised.
 
-    For third-party backends the message names only the exception class; the
-    original is chained. Errors that are already :class:`BackendError`
-    subclasses (raised by Headroom's own built-ins, with messages written to be
-    safe to log) pass through unchanged.
+    For third-party backends the message names only the exception class, even
+    for a :class:`BackendError` subclass; the original is chained. A
+    :class:`BackendError` raised by one of Headroom's own built-in backends
+    (an instance of a built-in class, whose messages are written to be safe to
+    log) passes through unchanged. :class:`CallableEmbeddingBackend` wraps
+    user code and is not a built-in.
     """
 
 
@@ -245,6 +249,8 @@ def embed_texts(
 
     Raises:
         EmbeddingBackendResponseError: The backend's output does not fit the request.
+        EmbeddingBackendCallError: ``embed`` raised. Only a built-in backend's
+            own :class:`BackendError` passes through instead.
     """
     import numpy as np
 
@@ -300,9 +306,9 @@ def embed_texts(
 def _call_embed(backend: EmbeddingBackend, texts: list[str], label: str) -> Any:
     try:
         return backend.embed(texts)
-    except BackendError:
-        raise
     except Exception as exc:
+        if isinstance(exc, BackendError) and EMBEDDING_BACKENDS.is_builtin_instance(backend):
+            raise
         logger.debug("Embedding backend %r failed: %s", label, describe_exception(exc))
         raise EmbeddingBackendCallError(
             f"Embedding backend {label!r} failed ({describe_class(type(exc))})"

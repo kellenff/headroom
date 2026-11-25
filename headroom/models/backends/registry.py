@@ -34,8 +34,8 @@ options routinely carry API keys. For third-party factories they also leave out
 the exception's own text, which can echo a credential-bearing URL or key; only
 its class is named, the original stays chained (``raise ... from exc``), and the
 detail is logged at DEBUG through :func:`headroom.log_safety.describe_exception`.
-Headroom's own built-ins are trusted to word their errors safely, so their
-messages are kept.
+This holds for a third-party :class:`BackendError` subclass too. Headroom's own
+built-ins are trusted to word their errors safely, so their messages are kept.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from __future__ import annotations
 import importlib
 import logging
 import re
+import sys
 import threading
 from collections.abc import Callable
 from importlib.metadata import EntryPoint, entry_points
@@ -113,6 +114,17 @@ def _import_target(target: str) -> Any:
     obj: Any = importlib.import_module(module_name)
     for attr in attr_path.split("."):
         obj = getattr(obj, attr)
+    return obj
+
+
+def _imported_target(target: str) -> Any:
+    """``target`` if its module is already imported, else ``None``. Never imports."""
+    module_name, _, attr_path = target.partition(":")
+    obj: Any = sys.modules.get(module_name)
+    for attr in attr_path.split("."):
+        if obj is None:
+            return None
+        obj = getattr(obj, attr, None)
     return obj
 
 
@@ -229,13 +241,8 @@ class BackendRegistry(Generic[T]):
             cached = self._loaded.get(name)
             if cached is not None:
                 return cached
-            source: Callable[..., T] | str | None = self._registered.get(name)
-            trusted = source is None and name in self._builtins
-            if source is None:
-                source = self._builtins.get(name)
-            if source is not None:
-                factory = self._resolve(name, source, trusted=trusted)
-                self._loaded[name] = factory
+            factory = self._load_registered_locked(name)
+            if factory is not None:
                 return factory
 
         ep = self._find_entry_point(name)
@@ -266,12 +273,35 @@ class BackendRegistry(Generic[T]):
         factory = cast("Callable[..., T]", loaded)
         with self._lock:
             # A registration may have raced us while the entry point was loading.
+            # It wins, as it would have without the race: register() only drops
+            # a cached factory, and none was cached yet.
+            registered = self._load_registered_locked(name)
+            if registered is not None:
+                return registered
             return self._loaded.setdefault(name, factory)
 
     def is_builtin(self, name: str) -> bool:
         """Whether ``name`` currently resolves to a Headroom built-in."""
         with self._lock:
             return name in self._builtins and name not in self._registered
+
+    def is_builtin_instance(self, obj: object) -> bool:
+        """Whether ``obj``'s class is exactly a built-in factory of this registry.
+
+        Used to decide whose error messages are safe to keep: an instance of a
+        Headroom built-in class runs Headroom's code, whatever name it was
+        selected by. A subclass does not count, since it may override any
+        method. Lazy built-ins are looked up only in modules already imported
+        (an instance of a class implies its module was), so this never imports.
+        """
+        cls = type(obj)
+        with self._lock:
+            sources = list(self._builtins.values())
+        for source in sources:
+            target = _imported_target(source) if isinstance(source, str) else source
+            if target is cls:
+                return True
+        return False
 
     def create(self, name: str, /, **options: Any) -> T:
         """Construct the backend registered under ``name`` with ``options``.
@@ -280,15 +310,17 @@ class BackendRegistry(Generic[T]):
             UnknownBackendError: Nothing is selectable under ``name``.
             BackendLoadError: The factory raised. The original exception is
                 chained; the message never includes ``options``, nor a
-                third-party factory's own error text.
+                third-party factory's own error text. A built-in's own
+                :class:`BackendError` passes through unchanged.
         """
         factory = self.get_factory(name)
         try:
             return factory(**options)
-        except BackendError:
-            raise
         except Exception as exc:
-            if self.is_builtin(name):
+            trusted = self._is_builtin_factory(name, factory)
+            if trusted and isinstance(exc, BackendError):
+                raise
+            if trusted:
                 detail = f"{type(exc).__name__}: {exc}"
             else:
                 logger.debug(
@@ -303,6 +335,27 @@ class BackendRegistry(Generic[T]):
             ) from exc
 
     # ------------------------------------------------------------------ internals
+
+    def _load_registered_locked(self, name: str) -> Callable[..., T] | None:
+        """Resolve and cache a registration or built-in. Call with the lock held."""
+        source: Callable[..., T] | str | None = self._registered.get(name)
+        trusted = source is None and name in self._builtins
+        if source is None:
+            source = self._builtins.get(name)
+        if source is None:
+            return None
+        factory = self._resolve(name, source, trusted=trusted)
+        self._loaded[name] = factory
+        return factory
+
+    def _is_builtin_factory(self, name: str, factory: Callable[..., T]) -> bool:
+        """Whether ``factory`` is the built-in that ``name`` still resolves to."""
+        with self._lock:
+            return (
+                name in self._builtins
+                and name not in self._registered
+                and self._loaded.get(name) is factory
+            )
 
     def _find_entry_point(self, name: str) -> EntryPoint | None:
         matches = [ep for ep in self._entry_points() if ep.name == name]

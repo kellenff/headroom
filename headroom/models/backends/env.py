@@ -11,7 +11,10 @@ uses ``HEADROOM_RELEVANCE_EMBEDDER``. For prefix ``P``:
                    ``P_MODEL``.
 ``P_MODEL``        Model id passed as the ``model`` option.
 ``P_BASE_URL``     ``base_url`` option (remote backends).
-``P_API_KEY``      ``api_key`` option.
+``P_API_KEY``      ``api_key`` option. Required for the built-in ``openai``
+                   backend on api.openai.com (``P_BASE_URL`` unset): a selection
+                   made here never falls back to ``OPENAI_API_KEY``, which in
+                   the proxy is the chat credential.
 ``P_DIMENSION``    ``dimension`` option, a positive integer. Memory requires it.
 ``P_HEADERS``      ``headers`` option, as ``Name=value`` pairs separated by commas.
                    Values cannot contain commas; use ``P_OPTIONS`` for those.
@@ -36,6 +39,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from .embedding import EMBEDDING_BACKENDS, EmbeddingBackend, create_embedding_backend
 from .registry import NAME_RE, UnknownBackendError
@@ -51,6 +55,9 @@ REUSE_MEMORY_EMBEDDER = "memory"
 MEMORY_EMBEDDER_RUNTIME_ENV = "HEADROOM_EMBEDDER_RUNTIME"
 
 _COMPANIONS = ("MODEL", "BASE_URL", "API_KEY", "DIMENSION", "HEADERS", "OPTIONS")
+#: The built-in ``openai`` backend's default host, where it would otherwise take
+#: ``OPENAI_API_KEY`` from the environment.
+_OPENAI_API_HOST = "api.openai.com"
 
 
 def parse_header_pairs(raw: str, var: str) -> dict[str, str]:
@@ -174,6 +181,41 @@ def _read_family(
     return EmbeddingBackendSettings(name=name, model=model, options=options, source=source)
 
 
+def _require_own_openai_key(
+    prefix: str, settings: EmbeddingBackendSettings | None
+) -> EmbeddingBackendSettings | None:
+    """Refuse an api.openai.com selection that has no key of its own.
+
+    The built-in ``openai`` backend falls back to ``OPENAI_API_KEY`` for
+    api.openai.com. In the proxy that variable is the chat credential, so an
+    operator selection would silently embed and bill under it. Returns
+    ``settings`` unchanged when they are fine.
+
+    Raises:
+        ValueError: Names ``{prefix}_API_KEY``, never a value.
+    """
+    if settings is None or settings.name != "openai" or not EMBEDDING_BACKENDS.is_builtin("openai"):
+        return settings
+    options = settings.options
+    api_key = options.get("api_key")
+    if api_key is not None and (not isinstance(api_key, str) or api_key.strip()):
+        return settings  # set; a non-string is the backend's to reject
+    base_url = options.get("base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        try:
+            host = urlsplit(base_url.strip()).hostname
+        except ValueError:
+            return settings  # malformed; the backend rejects it, naming base_url
+        if host != _OPENAI_API_HOST:
+            return settings
+    elif base_url is not None and not isinstance(base_url, str):
+        return settings  # the backend rejects it
+    raise ValueError(
+        f"{prefix}_API_KEY is required for the openai embedding backend on api.openai.com "
+        f"(set {prefix}_BASE_URL for another server); OPENAI_API_KEY is not used for embeddings"
+    )
+
+
 def _provider_name(raw: str, var: str, prefix: str) -> str:
     name = raw.strip().lower()
     if ":" in name:
@@ -194,8 +236,15 @@ def embedding_backend_settings_from_env(
     Returns ``None`` when ``{prefix}_PROVIDER`` is unset or blank.
 
     Raises:
-        ValueError: A variable is malformed.
+        ValueError: A variable is malformed, or the built-in ``openai`` backend
+            is selected for api.openai.com without ``{prefix}_API_KEY``.
     """
+    return _require_own_openai_key(prefix, _provider_settings(prefix, env))
+
+
+def _provider_settings(
+    prefix: str, env: Mapping[str, str] | None
+) -> EmbeddingBackendSettings | None:
     env = os.environ if env is None else env
     var = f"{prefix}_PROVIDER"
     raw = _get(env, var)
@@ -214,12 +263,14 @@ def memory_embedder_settings_from_env(
     embedder and cannot be combined with ``HEADROOM_EMBEDDER_PROVIDER``.
 
     Raises:
-        ValueError: A variable is malformed or the variables contradict each other.
+        ValueError: A variable is malformed, the variables contradict each
+            other, or ``openai`` is selected for api.openai.com without
+            ``HEADROOM_EMBEDDER_API_KEY``.
     """
     env = os.environ if env is None else env
     prefix = MEMORY_EMBEDDER_ENV_PREFIX
     runtime = _get(env, MEMORY_EMBEDDER_RUNTIME_ENV).lower()
-    settings = embedding_backend_settings_from_env(prefix, env)
+    settings = _provider_settings(prefix, env)
     if runtime == "openai":
         if settings is not None and settings.name != "openai":
             raise ValueError(
@@ -233,7 +284,7 @@ def memory_embedder_settings_from_env(
             f"{MEMORY_EMBEDDER_RUNTIME_ENV} picks the device for the built-in embedder and "
             f"cannot be combined with {prefix}_PROVIDER; unset one of them"
         )
-    return settings
+    return _require_own_openai_key(prefix, settings)
 
 
 def relevance_embedder_settings_from_env(
