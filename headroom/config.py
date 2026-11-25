@@ -166,6 +166,37 @@ class RelevanceScorerConfig:
     # Lower threshold = safer (keeps more items), higher = more aggressive compression
     relevance_threshold: float = 0.25  # Keep items above this score
 
+    # Embedding backend for the ContentRouter relevance split, in place of the
+    # built-in fastembed model (the Rust SmartCrusher scorer does not read it).
+    # None (default) keeps fastembed. Otherwise a registry spec, "name" or
+    # "name:model", constructed with no further options, or "env": whatever the
+    # HEADROOM_RELEVANCE_EMBEDDER_* variables select, read when the scorer is
+    # built (nothing selected keeps fastembed). The library reads those
+    # variables only when this says "env". A string, not a backend instance,
+    # because the router hashes its config into a namespace that must be the
+    # same in every process; pass instances to create_scorer(embedding_backend=).
+    # A configured backend is sent the scored tool output.
+    embedding_backend: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.embedding_backend is None:
+            return
+        from headroom.relevance.backend_config import (
+            EMBEDDING_BACKEND_FROM_ENV,
+            validate_relevance_embedding_backend_value,
+        )
+
+        validate_relevance_embedding_backend_value(self.embedding_backend)
+        from_env = self.embedding_backend.strip().lower() == EMBEDDING_BACKEND_FROM_ENV
+        if self.tier == "bm25" and not from_env:
+            # "env" is exempt so one config can carry the operator's selection
+            # whatever the tier; a named backend on a tier that never embeds is
+            # a mistake to report, not ignore.
+            raise ValueError(
+                "RelevanceScorerConfig.embedding_backend needs tier 'hybrid' or 'embedding'; "
+                "tier 'bm25' never embeds"
+            )
+
 
 @dataclass
 class AnchorConfig:
