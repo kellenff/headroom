@@ -58,7 +58,41 @@ family instead (same suffixes as memory, listed
 [below](#environment-variables)). Relevance runs on the request path, so the
 built-in `openai` backend defaults there to a 5-second timeout and no retries.
 After a failure it backs off for 30 seconds, and the request falls back to
-BM25 keyword scoring.
+BM25 keyword scoring. A tool output that splits into more than 512 records is
+not relevance-split while a backend is configured, so one output never becomes
+an unbounded number of embedding requests; set
+`ContentRouterConfig.relevance_max_records` to choose another bound.
+
+`compress()` never reads these variables and keeps the default scorer. A
+`ContentRouter` you build yourself takes a backend in its config: a name,
+optionally `name:model`, or `"env"` to follow the
+`HEADROOM_RELEVANCE_EMBEDDER_*` variables. A backend that needs options such
+as a URL is registered with them bound, then named:
+
+```python
+from functools import partial
+
+from headroom.config import RelevanceScorerConfig
+from headroom.models.backends import register_embedding_backend
+from headroom.models.backends.openai_compat import OpenAICompatibleEmbeddingBackend
+from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+register_embedding_backend(
+    "my-server",
+    partial(
+        OpenAICompatibleEmbeddingBackend,
+        base_url="http://10.0.0.5:8080/v1",
+        timeout=5.0,
+        max_retries=0,
+    ),
+)
+router = ContentRouter(
+    ContentRouterConfig(relevance=RelevanceScorerConfig(embedding_backend="my-server:bge-small"))
+)
+```
+
+The 5-second, no-retry defaults apply only to the built-in `openai` name, so
+set them yourself on a registered factory.
 
 <Callout type="warn" title="Content leaves the box">
 Relevance scoring sends the user's prompt and the tool output being compressed
@@ -125,7 +159,8 @@ name: `HEADROOM_EMBEDDER_PROVIDER=my-embedder`,
 `MemoryConfig(embedder_backend=EmbedderBackend.EXTERNAL, embedder_backend_name="my-embedder:my-model")`
 or `create_scorer(embedding_backend="my-embedder")`. Options from
 `*_BASE_URL`, `*_API_KEY`, `*_HEADERS` and `*_OPTIONS` arrive as keyword
-arguments.
+arguments. With `EmbedderBackend.EXTERNAL` the model comes from the
+`name:model` spec or `embedder_options["model"]`; `embedder_model` is not used.
 
 In Python you can also register one without packaging it:
 
@@ -189,9 +224,15 @@ Memory reads the `HEADROOM_EMBEDDER_*` family and relevance scoring reads
 embedder (`cpu`, `pytorch_mps`) and cannot be combined with
 `HEADROOM_EMBEDDER_PROVIDER`, apart from `cpu` and the `openai` alias.
 
-The proxy checks these at startup. An unknown backend name, a malformed value,
-or a backend that fails to construct stops the proxy with a message that names
-the variable, instead of quietly running without the feature.
+The proxy checks every selection at startup: the memory embedder when memory
+runs on the `local` backend, and the relevance embedder and Kompress provider
+when the proxy optimizes. It constructs each selected backend once and closes
+it. An unknown backend name, a malformed value, a backend that fails to
+construct (a missing model, key or package), or one that would dial out under
+`HEADROOM_OFFLINE` stops the proxy with exit code 78 and a message that names
+the variable, instead of quietly running without the feature. The built-in
+backends open no connection and load no model when constructed; a plugin
+should do the same.
 
 ## One embedding space per database
 
@@ -246,15 +287,23 @@ export HEADROOM_KOMPRESS_PROVIDER=my-compressor
 export HEADROOM_KOMPRESS_PROVIDER_OPTIONS='{"device": "cuda"}'   # optional, JSON object
 ```
 
-`compress_text` may also return a mapping with the
-[remote endpoint's response fields](/docs/proxy) (`compressed`, plus optional
-token counts). It must be thread-safe and deterministic, because compressed
-blocks are cached and re-sent as a stable prompt prefix. `HEADROOM_KOMPRESS_PROVIDER`
-takes precedence over `HEADROOM_KOMPRESS_ENDPOINT`. Turning Kompress off still
-turns it off. A provider that cannot be loaded disables ML compression and
-logs an error; Headroom does not silently swap in the local model.
-`HEADROOM_KOMPRESS_BACKEND` is unrelated: it picks the inference runtime of the
-built-in model. Health endpoints report a provider as `custom`.
+`compress_text` may also return a mapping with the remote endpoint's response
+fields: `compressed` (a non-empty string), and optionally `original_tokens`,
+`compressed_tokens`, `compression_ratio` and `model_used`. It receives blocks of
+at least 64 words. It must be thread-safe and deterministic, because compressed
+blocks are cached and re-sent as a stable prompt prefix. Each call is capped by
+the request's ML time budget and at most 20 seconds. A call that runs over is
+abandoned, not interrupted, so put a timeout on any I/O. An optional `close()`
+is called when the compressor is closed. The proxy builds one instance per
+pipeline, so share a heavy in-process model between instances.
+
+Set `HEADROOM_KOMPRESS_PROVIDER` or `HEADROOM_KOMPRESS_ENDPOINT`, not both. The
+proxy refuses to start with both; elsewhere the provider wins and a warning is
+logged. Turning Kompress off still turns it off. A provider that cannot be
+loaded disables ML compression and logs an error once; Headroom does not
+silently swap in the local model. `HEADROOM_KOMPRESS_BACKEND` is unrelated: it
+picks the inference runtime of the built-in model. Health endpoints report a
+provider as `custom`.
 
 To serve a model from another process or machine instead, implement the HTTP
 contract of `HEADROOM_KOMPRESS_ENDPOINT`. For a compressor that replaces
