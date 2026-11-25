@@ -13,7 +13,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from headroom.memory.config import MemoryConfig
-from headroom.memory.factory import _adapt_text_search, create_memory_system
+from headroom.memory.factory import (
+    _adapt_text_search,
+    create_memory_system,
+    embedder_is_shared,
+)
 from headroom.memory.models import Memory, ScopeLevel
 from headroom.memory.ports import MemoryFilter, TextFilter, VectorFilter
 
@@ -79,6 +83,8 @@ class HierarchicalMemory:
         embedder: Embedder,
         cache: MemoryCache | None = None,
         config: MemoryConfig | None = None,
+        *,
+        owns_embedder: bool = True,
     ) -> None:
         """Initialize HierarchicalMemory with components.
 
@@ -91,12 +97,16 @@ class HierarchicalMemory:
             embedder: Text embedding generator.
             cache: Optional memory cache.
             config: Configuration (for bubbling settings, etc.).
+            owns_embedder: Whether :meth:`close` closes ``embedder``. Pass
+                ``False`` for an embedder other memory systems share, or one
+                the caller closes itself.
         """
         self._store = store
         self._vector_index = vector_index
         self._text_index = text_index
         self._search_text = _adapt_text_search(text_index)
         self._embedder = embedder
+        self._owns_embedder = owns_embedder
         self._cache = cache
         self._config = config or MemoryConfig()
 
@@ -123,7 +133,18 @@ class HierarchicalMemory:
         """
         config = config or MemoryConfig()
         store, vector_index, text_index, embedder, cache = await create_memory_system(config)
-        return cls(store, vector_index, text_index, embedder, cache, config)
+        # The factory hands out process-wide cached embedders and the caller's
+        # own ``config.embedder``; closing this instance must leave those open
+        # for every other memory system that holds them.
+        return cls(
+            store,
+            vector_index,
+            text_index,
+            embedder,
+            cache,
+            config,
+            owns_embedder=not embedder_is_shared(config, embedder),
+        )
 
     # =========================================================================
     # Memory Creation
@@ -937,10 +958,12 @@ class HierarchicalMemory:
         """Close all resources held by the memory system.
 
         This should be called when done using the memory system to properly
-        clean up resources like HTTP clients used by embedders.
+        clean up resources like HTTP clients used by embedders. An embedder
+        this instance does not own (``owns_embedder=False``) is left open.
         """
-        # Close embedder if it has a close method (e.g., API-based embedders)
-        if hasattr(self._embedder, "close"):
+        # Close the embedder only if this instance owns it: a shared one is
+        # still serving other memory systems (see ``owns_embedder``).
+        if self._owns_embedder and hasattr(self._embedder, "close"):
             await self._embedder.close()
 
         # Close store if it has a close method

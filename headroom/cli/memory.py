@@ -233,15 +233,29 @@ async def _apply_supersession_repair(
     new_memory_id: str,
     vector_dimension: int,
 ) -> tuple[Memory, Memory]:
-    """Apply a repair through LocalBackend so indexes and cache are refreshed."""
-    from ..memory.backends.local import LocalBackend, LocalBackendConfig
+    """Apply a repair through LocalBackend so indexes and cache are refreshed.
 
-    backend = LocalBackend(
-        LocalBackendConfig(
-            db_path=db_path,
-            vector_dimension=vector_dimension,
-        )
+    The embedder must be the one that wrote the database, or its identity check
+    refuses to open it, so ``HEADROOM_EMBEDDER_*`` is honoured as in the proxy.
+    """
+    from ..memory.backends.local import LocalBackend, LocalBackendConfig
+    from ..memory.embedder_env import (
+        MEMORY_EMBEDDER_DIMENSION_ENV,
+        local_backend_embedder_kwargs_from_env,
     )
+
+    embedder_kwargs = local_backend_embedder_kwargs_from_env()
+    if embedder_kwargs:
+        if embedder_kwargs["vector_dimension"] != vector_dimension:
+            raise ValueError(
+                f"{MEMORY_EMBEDDER_DIMENSION_ENV}={embedder_kwargs['vector_dimension']} but the "
+                f"stored embeddings have {vector_dimension} dimensions; use the settings that "
+                "wrote this database"
+            )
+    else:
+        embedder_kwargs = {"vector_dimension": vector_dimension}
+
+    backend = LocalBackend(LocalBackendConfig(db_path=db_path, **embedder_kwargs))
     try:
         return await backend.detach_supersession(old_memory_id, new_memory_id)
     finally:

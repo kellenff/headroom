@@ -1409,6 +1409,8 @@ async def test_ensure_initialized_timeout_and_cancellation(
 async def test_init_backend_locked_local_and_bridge_import(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    for var in ("HEADROOM_EMBEDDER_PROVIDER", "HEADROOM_EMBEDDER_RUNTIME"):
+        monkeypatch.delenv(var, raising=False)
     handler = MemoryHandler(
         MemoryConfig(
             enabled=True,
@@ -1456,13 +1458,13 @@ async def test_init_backend_locked_local_and_bridge_import(
     assert handler.initialized is True
     assert seen["backend_initialized"] is True
     assert seen["bridge_called"] is True
+    # With no HEADROOM_EMBEDDER_PROVIDER the default stays exactly what it was
+    # before pluggable embedders: ONNX MiniLM, 384 dimensions, nothing else.
     assert seen["config"] == {
         "db_path": str(tmp_path / "memory.db"),
         "embedder_backend": "onnx",
         "embedder_model": "all-MiniLM-L6-v2",
         "vector_dimension": 384,
-        "openai_api_key": None,
-        "openai_base_url": None,
     }
 
 

@@ -86,6 +86,32 @@ def test_memory_wrapper_lazy_initialization_and_factory(monkeypatch: pytest.Monk
     assert wrapped._top_k == 3
 
 
+def test_memory_wrapper_forwards_a_custom_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _response = make_client()
+    seen: list[object] = []
+
+    async def fake_create(config):  # noqa: ANN001
+        seen.append(config)
+        return FakeMemory()
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr("headroom.memory.wrapper.HierarchicalMemory.create", fake_create)
+
+    for wrapper in (
+        MemoryWrapper(client, user_id="alice", embedder=embed, vector_dimension=2),
+        with_memory(client, user_id="bob", embedder=embed, vector_dimension=2),
+        MemoryWrapper(client, user_id="carol"),
+    ):
+        wrapper._ensure_initialized()
+
+    custom, via_helper, default = seen
+    assert custom.embedder is embed and custom.vector_dimension == 2
+    assert via_helper.embedder is embed and via_helper.vector_dimension == 2
+    assert default.embedder is None and default.vector_dimension == 384
+
+
 def test_inject_memories_handles_empty_and_inserts_context() -> None:
     client, _response = make_client()
     fake_memory = FakeMemory()

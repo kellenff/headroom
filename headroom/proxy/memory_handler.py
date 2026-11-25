@@ -43,6 +43,8 @@ from headroom.memory.storage_router import (
     RequestContext,
     ResolvedScope,
 )
+from headroom.models.backends import BackendError
+from headroom.offline import OfflineEgressBlocked, note_refusal
 from headroom.proxy.public_errors import tool_result_error
 
 if TYPE_CHECKING:
@@ -94,6 +96,29 @@ NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
 # stays False so that subsequent requests retry instead of deadlocking.
 # See wiki/plans/2026-04-17-fix-codex-proxy-resilience-plan.md "Risks" row 7.
 STARTUP_INIT_TIMEOUT_SECONDS = 30.0
+
+
+#: Longest init error kept and logged; an exception message can be unbounded.
+_MAX_INIT_ERROR_CHARS = 500
+
+
+def _is_configuration_error(exc: Exception) -> bool:
+    """Whether retrying the init cannot help until the configuration changes.
+
+    ``ValueError`` covers malformed ``HEADROOM_EMBEDDER_*`` values, a missing
+    dimension and :class:`~headroom.memory.embedder_identity.EmbedderMismatchError`;
+    ``BackendError`` an unknown or unconstructible embedding backend. A
+    connection failure is transient even when it is a ``BackendError``.
+    """
+    if isinstance(exc, ConnectionError | TimeoutError):
+        return False
+    return isinstance(exc, ValueError | BackendError)
+
+
+def _bounded(message: str) -> str:
+    if len(message) <= _MAX_INIT_ERROR_CHARS:
+        return message
+    return message[: _MAX_INIT_ERROR_CHARS - 3] + "..."
 
 
 def _serialize_created_at(value: Any) -> str | None:
@@ -198,6 +223,12 @@ class MemoryHandler:
             )
         )
         self._initialized = False
+        # Why memory is off for the rest of this process, once init failed in
+        # a way a retry cannot fix (bad configuration, an air-gap refusal).
+        # While set, init is not attempted again.
+        self._init_error: str | None = None
+        # The variable that selected a pluggable embedder, for error messages.
+        self._embedder_source: str | None = None
         # Async singleflight guard for backend init. Ensures concurrent first
         # callers land on one init (double-checked pattern inside
         # _ensure_initialized). Not used by the legacy sync _initialized flag
@@ -273,12 +304,19 @@ class MemoryHandler:
         configurable timeout (``STARTUP_INIT_TIMEOUT_SECONDS``); on timeout
         ``self._initialized`` stays ``False`` so a later request can retry
         (fail-open contract — no exception propagates to request handlers).
+
+        Failures a retry cannot fix are not retried: a configuration error
+        (``ValueError`` or a model-backend ``BackendError``, such as a missing
+        ``HEADROOM_EMBEDDER_DIMENSION`` or a database written by another
+        embedder) and an air-gap refusal (``OfflineEgressBlocked``). Each is
+        logged once and leaves memory off until the process restarts;
+        :attr:`init_error` says why.
         """
         # Fast path: already initialized, no lock contention.
         if self._initialized:
             return
 
-        if not self.config.enabled:
+        if not self.config.enabled or self._init_error is not None:
             return
 
         lock = self._get_init_lock()
@@ -286,8 +324,9 @@ class MemoryHandler:
         async def _do_init() -> None:
             async with lock:
                 # Double-check after acquiring the lock — another task may
-                # have completed the init while we were waiting.
-                if self._initialized:
+                # have completed the init (or failed it for good) while we
+                # were waiting.
+                if self._initialized or self._init_error is not None:
                     return
                 await self._init_backend_locked()
 
@@ -326,6 +365,17 @@ class MemoryHandler:
             self._initialized = False
             logger.info(f"Memory: backend initialization cancelled (backend={self.config.backend})")
             raise
+        except OfflineEgressBlocked as blocked:
+            # HEADROOM_OFFLINE refused the embedder's (or Qdrant's) network
+            # access. That is the operator's decision, not a fault: report it
+            # once and serve without memory rather than retry every request.
+            existing_backend = self._backend
+            if existing_backend is not None:
+                await self._close_backend_instance(existing_backend, reason="offline refusal")
+            self._backend = None
+            self._initialized = False
+            self._init_error = note_refusal(blocked, logger)
+            return
         except Exception as exc:
             # Fail-open for ANY init failure, not just timeout. Memory is an
             # optional subsystem: a backend that cannot open (e.g. a SQLite
@@ -334,12 +384,30 @@ class MemoryHandler:
             # request — the docstring's fail-open contract has to hold here too.
             # Null the possibly-half-assigned backend (same reasoning as the
             # timeout branch) and leave ``_initialized=False`` so a later
-            # request can retry once the environment recovers.
+            # request can retry once the environment recovers. A configuration
+            # error is the exception: no retry fixes it, so it is reported once.
             existing_backend = self._backend
             if existing_backend is not None:
                 await self._close_backend_instance(existing_backend, reason="init_error")
             self._backend = None
             self._initialized = False
+            if _is_configuration_error(exc):
+                self._init_error = _bounded(str(exc))
+                # A backend's own error names the backend, not the variable
+                # that chose it; say which one to fix.
+                hint = (
+                    f" [check {self._embedder_source} and the other HEADROOM_EMBEDDER_* settings]"
+                    if self._embedder_source and isinstance(exc, BackendError)
+                    else ""
+                )
+                logger.error(
+                    "Memory: disabled until restart because the memory configuration is "
+                    "invalid (backend=%s): %s%s",
+                    self.config.backend,
+                    self._init_error,
+                    hint,
+                )
+                return
             logger.error(
                 "Memory: backend initialization failed (backend=%s); "
                 "serving requests without memory context. Subsequent requests will retry: %s",
@@ -352,85 +420,35 @@ class MemoryHandler:
         """Actual backend-init body. Must be called with ``_init_lock`` held."""
         if self.config.backend == "local":
             from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
-
-            # Auto-detect embedder: ONNX (default, ~86MB, no torch) → local (if torch available)
-            embedder_backend = "onnx"
-            embedder_model = "all-MiniLM-L6-v2"
-            vector_dimension = 384
-            openai_api_key = None
-            openai_base_url = None
-            runtime = os.environ.get("HEADROOM_EMBEDDER_RUNTIME", "").strip().lower()
-
-            if runtime == "openai":
-                try:
-                    vector_dimension = int(os.environ.get("HEADROOM_EMBEDDER_DIMENSION", ""))
-                except ValueError as exc:
-                    raise ValueError(
-                        "HEADROOM_EMBEDDER_DIMENSION must be a positive integer"
-                    ) from exc
-                if vector_dimension < 1:
-                    raise ValueError("HEADROOM_EMBEDDER_DIMENSION must be a positive integer")
-                embedder_model = os.environ.get("HEADROOM_EMBEDDER_MODEL", "").strip()
-                if not embedder_model:
-                    raise ValueError("HEADROOM_EMBEDDER_MODEL is required for the openai runtime")
-                openai_api_key = os.environ.get("HEADROOM_EMBEDDER_API_KEY", "").strip()
-                if not openai_api_key:
-                    raise ValueError("HEADROOM_EMBEDDER_API_KEY is required for the openai runtime")
-                openai_base_url = os.environ.get("HEADROOM_EMBEDDER_BASE_URL", "").strip() or None
-                embedder_backend = "openai"
-
-            # Opt-in GPU offload: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps routes embedding
-            # through the torch sentence-transformers backend on the Apple GPU (MPS).
-            # LocalEmbedder serializes MPS encode calls (torch-MPS is not thread-safe).
-            # We switch only when MPS is actually available; otherwise keep the
-            # existing default embedder selection path (ONNX when available, then
-            # the pre-existing local sentence-transformers fallback).
-            elif runtime == "pytorch_mps":
-                try:
-                    import sentence_transformers  # noqa: F401
-                    import torch
-
-                    if torch.backends.mps.is_available():
-                        embedder_backend = "local"
-                        logger.info(
-                            "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps → "
-                            "torch embedder on Apple GPU (MPS)"
-                        )
-                    else:
-                        logger.warning(
-                            "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps requested but "
-                            "MPS is not available; using default embedder selection"
-                        )
-                except ImportError:
-                    logger.warning(
-                        "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps requested but "
-                        "torch/sentence-transformers not installed; using default embedder selection"
-                    )
-
-            # Check if ONNX runtime is available (should be — it's in proxy deps)
-            if embedder_backend == "onnx":
-                try:
-                    import onnxruntime  # noqa: F401
-                except ImportError:
-                    # Fall back to sentence-transformers (requires torch)
-                    embedder_backend = "local"
-                    logger.info(
-                        "Memory: onnxruntime not available, falling back to sentence-transformers"
-                    )
-
-            backend_config = LocalBackendConfig(
-                db_path=self.config.db_path,
-                embedder_backend=embedder_backend,
-                embedder_model=embedder_model,
-                vector_dimension=vector_dimension,
-                openai_api_key=openai_api_key,
-                openai_base_url=openai_base_url,
+            from headroom.memory.embedder_env import (
+                local_backend_embedder_kwargs,
+                validate_memory_embedder_env,
             )
+
+            # HEADROOM_EMBEDDER_PROVIDER (or the older RUNTIME=openai spelling)
+            # selects a pluggable embedding backend. Settled before anything is
+            # opened, so a bad value fails without creating a database file.
+            settings = validate_memory_embedder_env()
+            if settings is not None:
+                self._embedder_source = settings.source
+                backend_config = LocalBackendConfig(
+                    db_path=self.config.db_path,
+                    **local_backend_embedder_kwargs(settings),
+                )
+                embedder_label = (
+                    f"{settings.name} ({settings.model or 'default model'}, "
+                    f"{backend_config.vector_dimension}-dim)"
+                )
+            else:
+                default_kwargs = self._default_embedder_kwargs()
+                backend_config = LocalBackendConfig(db_path=self.config.db_path, **default_kwargs)
+                embedder_label = str(default_kwargs["embedder_backend"])
+
             self._backend = LocalBackend(backend_config)
             await self._backend._ensure_initialized()
             logger.info(
                 f"Memory: Initialized LocalBackend at {self.config.db_path} "
-                f"(embedder: {embedder_backend})"
+                f"(embedder: {embedder_label})"
             )
 
             # Per-project routing (GH #462). The router shares the same
@@ -490,6 +508,60 @@ class MemoryHandler:
         # Auto-import from Memory Bridge if configured
         if self.config.bridge_enabled and self.config.bridge_auto_import:
             await self._init_and_import_bridge()
+
+    @staticmethod
+    def _default_embedder_kwargs() -> dict[str, Any]:
+        """The built-in embedder: ONNX MiniLM, torch on Apple GPU when asked for."""
+        # Auto-detect embedder: ONNX (default, ~86MB, no torch) → local (if torch available)
+        embedder_backend = "onnx"
+        embedder_model = "all-MiniLM-L6-v2"
+        vector_dimension = 384
+        runtime = os.environ.get("HEADROOM_EMBEDDER_RUNTIME", "").strip().lower()
+
+        # Opt-in GPU offload: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps routes embedding
+        # through the torch sentence-transformers backend on the Apple GPU (MPS).
+        # LocalEmbedder serializes MPS encode calls (torch-MPS is not thread-safe).
+        # We switch only when MPS is actually available; otherwise keep the
+        # existing default embedder selection path (ONNX when available, then
+        # the pre-existing local sentence-transformers fallback).
+        if runtime == "pytorch_mps":
+            try:
+                import sentence_transformers  # noqa: F401
+                import torch
+
+                if torch.backends.mps.is_available():
+                    embedder_backend = "local"
+                    logger.info(
+                        "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps → "
+                        "torch embedder on Apple GPU (MPS)"
+                    )
+                else:
+                    logger.warning(
+                        "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps requested but "
+                        "MPS is not available; using default embedder selection"
+                    )
+            except ImportError:
+                logger.warning(
+                    "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps requested but "
+                    "torch/sentence-transformers not installed; using default embedder selection"
+                )
+
+        # Check if ONNX runtime is available (should be — it's in proxy deps)
+        if embedder_backend == "onnx":
+            try:
+                import onnxruntime  # noqa: F401
+            except ImportError:
+                # Fall back to sentence-transformers (requires torch)
+                embedder_backend = "local"
+                logger.info(
+                    "Memory: onnxruntime not available, falling back to sentence-transformers"
+                )
+
+        return {
+            "embedder_backend": embedder_backend,
+            "embedder_model": embedder_model,
+            "vector_dimension": vector_dimension,
+        }
 
     async def _init_and_import_bridge(self) -> None:
         """Initialize the Memory Bridge and run auto-import."""
@@ -2150,13 +2222,24 @@ To SAVE: create /memories/<topic>.txt "content"
         """Initialize the configured backend so readiness checks can be accurate."""
         await self._ensure_initialized()
 
+    @property
+    def init_error(self) -> str | None:
+        """Why memory is off for the rest of this process, or ``None``.
+
+        Set when initialization failed in a way a retry cannot fix (invalid
+        configuration, an air-gap refusal); requests are then served without
+        memory and init is not attempted again.
+        """
+        return self._init_error
+
     async def warmup_embedder(self) -> bool:
         """Force one warm-up embed call so the ONNX graph is compiled now.
 
         Returns ``True`` if the embedder was exercised successfully,
         ``False`` otherwise. Best-effort — all errors are swallowed and
         logged, never raised, so startup cannot be blocked by embedder
-        cold-start failures.
+        cold-start failures. An air-gap refusal (``OfflineEgressBlocked``)
+        would refuse every later embed too, so it also turns memory off.
 
         Only meaningful for the ``local`` backend (the ONNX/sentence
         embedder warm-up is what we want to preempt). Qdrant/Neo4j is a
@@ -2177,6 +2260,14 @@ To SAVE: create /memories/<topic>.txt "content"
             await embedder.embed("warmup")
             logger.info("Memory: embedder warm-up encode complete")
             return True
+        except OfflineEgressBlocked as blocked:
+            self._init_error = note_refusal(blocked, logger)
+            backend = self._backend
+            self._backend = None
+            self._initialized = False
+            if backend is not None:
+                await self._close_backend_instance(backend, reason="offline refusal")
+            return False
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"Memory: embedder warm-up failed (non-fatal): {exc}")
             return False

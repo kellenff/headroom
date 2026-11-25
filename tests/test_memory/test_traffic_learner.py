@@ -3392,3 +3392,81 @@ def test_oversized_path_basename_skips_the_quadratic_edit_distance(monkeypatch):
     assert not tl._paths_related_as_typo(f"/a/{name}.rs", f"/a/{name}x.rs")
     assert tl._paths_related_as_typo("/a/staet.rs", "/a/state.rs")
     assert oversized == []
+
+
+# =============================================================================
+# Air-gap refusals while saving
+# =============================================================================
+
+
+class _RefusingBackend(_FakeBackend):
+    """A backend whose embedder is not allowed to reach its server."""
+
+    def __init__(self, db_path, purpose: str):
+        super().__init__(db_path)
+        self.purpose = purpose
+        self.attempts = 0
+
+    async def save_memory(self, **kwargs):
+        from headroom.offline import OfflineEgressBlocked
+
+        self.attempts += 1
+        raise OfflineEgressBlocked(self.purpose, "embeddings.example")
+
+
+class TestAirGapRefusal:
+    @pytest.mark.asyncio
+    async def test_the_save_worker_stops_cleanly_and_keeps_the_evidence(self, tmp_path, caplog):
+        """Before: the refusal (a BaseException) killed the worker task with
+        nothing logged until garbage collection, and the evidence was lost."""
+        import json
+        import logging
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _RefusingBackend(db, "learner test embedding API (worker)")
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        await learner.start()
+        try:
+            with caplog.at_level(logging.WARNING, logger="headroom.memory.traffic_learner"):
+                await TestSaveRecovery._feed(learner, "Use uv for Python packages.", 1)
+                await asyncio.wait_for(asyncio.shield(learner._save_task), 2)
+            assert learner._save_task.exception() is None
+            assert "HEADROOM_OFFLINE" in caplog.text
+            assert "saving stopped" in caplog.text
+            (pattern, _count) = next(iter(learner._pattern_counts.values()))
+            assert pattern.content == "Use uv for Python packages."
+        finally:
+            await learner.stop()
+        assert backend.attempts == 1
+        snapshot = json.loads((tmp_path / "pending_patterns.json").read_text())
+        assert [entry["content"] for entry in snapshot["patterns"]] == [
+            "Use uv for Python packages."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stop_snapshots_and_flushes_after_a_refusal(self, tmp_path, monkeypatch):
+        import json
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _RefusingBackend(db, "learner test embedding API (stop)")
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        flushed = []
+
+        async def flush_to_file() -> None:
+            flushed.append(True)
+
+        monkeypatch.setattr(learner, "flush_to_file", flush_to_file)
+        # No worker running: both patterns wait in the queue for stop() to drain.
+        await TestSaveRecovery._feed(learner, "Use uv for Python packages.", 1)
+        await TestSaveRecovery._feed(learner, "Run ruff before committing.", 1)
+        await learner.stop()
+
+        assert backend.attempts == 1  # the second save is not attempted
+        assert flushed == [True]
+        snapshot = json.loads((tmp_path / "pending_patterns.json").read_text())
+        assert sorted(entry["content"] for entry in snapshot["patterns"]) == [
+            "Run ruff before committing.",
+            "Use uv for Python packages.",
+        ]

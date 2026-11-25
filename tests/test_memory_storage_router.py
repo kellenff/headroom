@@ -439,6 +439,53 @@ def test_router_project_mode_two_cwds_two_paths(
     assert scope_b.display_name == "b"
 
 
+def test_router_project_backends_inherit_every_template_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-project configs are copies of the template with only the paths changed.
+
+    They used to be rebuilt field by field, so each new setting (the custom
+    embedding API's base URL, then the pluggable embedder) silently fell back
+    to its default in project databases until someone extended the list.
+    """
+    monkeypatch.setattr("headroom.memory.storage_router.LocalBackend", _FakeBackend)
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0] for _ in texts]
+
+    template = LocalBackendConfig(
+        db_path=str(tmp_path / "memory.db"),
+        embedder_backend="external",
+        embedder_backend_name="openai:nomic-embed-text",
+        embedder_options={"base_url": "http://gpu-box:8080/v1"},
+        embedder=embed,
+        vector_dimension=768,
+        enforce_embedder_identity=False,
+        cache_max_size=7,
+    )
+    router = BackendRouter(
+        BackendRouterConfig(
+            mode=MemoryStorageMode.PROJECT,
+            root_dir=tmp_path / "memories",
+            global_db_path=tmp_path / "memory.db",
+            backend_config_template=template,
+        )
+    )
+
+    backend, scope = router.backend_for(_ctx(headers={"x-headroom-cwd": "/code/a"}))
+    cfg = backend.cfg
+    assert cfg.db_path == str(scope.db_path)
+    assert cfg.graph_db_path == str(scope.db_path.with_name("memory_graph.db"))
+    assert cfg.embedder_backend == "external"
+    assert cfg.embedder_backend_name == "openai:nomic-embed-text"
+    assert cfg.embedder_options == {"base_url": "http://gpu-box:8080/v1"}
+    assert cfg.embedder is embed
+    assert cfg.vector_dimension == 768
+    assert cfg.enforce_embedder_identity is False
+    assert cfg.cache_max_size == 7
+    assert template.db_path == str(tmp_path / "memory.db")  # the template is untouched
+
+
 def test_router_project_mode_unresolved_fails_closed_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

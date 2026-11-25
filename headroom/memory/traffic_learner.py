@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from headroom.learn._shared import classify_error
+from headroom.offline import OfflineEgressBlocked, note_refusal
 
 if TYPE_CHECKING:
     from headroom.learn.models import ProjectInfo
@@ -604,6 +605,11 @@ class TrafficLearner:
             pattern = self._save_queue.get_nowait()
             try:
                 await self._save_pattern(pattern)
+            except OfflineEgressBlocked as blocked:
+                # The rest would be refused too; they are still queued, and
+                # queued patterns are part of the snapshot below.
+                note_refusal(blocked, logger)
+                break
             except Exception as exc:
                 logger.warning("Traffic learner shutdown save failed: %r", exc)
 
@@ -1426,7 +1432,7 @@ class TrafficLearner:
                     raise RuntimeError("Learner evidence update was not persisted")
                 saved_count = target_count
                 refresh = False
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError, OfflineEgressBlocked):
             self._restore_pattern(pattern)
             raise
         else:
@@ -1442,12 +1448,22 @@ class TrafficLearner:
             self._queued_patterns.pop(h, None)
 
     async def _save_worker(self) -> None:
-        """Background worker that persists patterns to memory backend."""
+        """Background worker that persists patterns to memory backend.
+
+        Stops on an air-gap refusal (``OfflineEgressBlocked``, raised when the
+        memory embedder may not reach its server): every later save would be
+        refused the same way. The refusal is reported, and the patterns stay
+        pending, so the shutdown snapshot keeps them for a later run.
+        """
         while True:
             try:
                 pattern = await self._save_queue.get()
                 await self._save_pattern(pattern)
             except asyncio.CancelledError:
+                break
+            except OfflineEgressBlocked as blocked:
+                note_refusal(blocked, logger)
+                logger.warning("Traffic learner: saving stopped; patterns stay pending")
                 break
             except Exception as exc:
                 logger.warning("Traffic learner save failed: %r", exc)
